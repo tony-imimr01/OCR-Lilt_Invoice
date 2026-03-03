@@ -1,618 +1,632 @@
 #!/usr/bin/env python3
 """
-LiLT Training Script - FIXED for LayoutLMv3Processor input format
-✅ CRITICAL FIX: Pass images/text/boxes/labels as LISTS to processor
-✅ LayoutLMv3Processor requires list inputs even for single examples
-✅ Removed all deprecated imports (LayoutLMv2FeatureExtractor)
-✅ Automatic label alignment via word_labels parameter
+lilt_invoice_train_final.py — COMPLETE FIXED VERSION
+✅ Token class weights for balanced HEADER/QUESTION/ANSWER learning
+✅ Relation class weights to handle no_relation dominance
+✅ Proper hidden state extraction for relation extraction
+✅ Saves label maps in format expected by lilt_inference_relation_v6.py
+✅ Uses eval_f1 for best model selection (HEADER may not be in val set)
+✅ Fixed numpy array handling in compute_token_metrics
+✅ **CORRECTED BIO TAGGING** – now uses B- for first token, I- for subsequent tokens
 """
-import sys
 import json
+import os
+import random
+import warnings
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from datetime import datetime
+from collections import Counter
+
 import numpy as np
-from PIL import Image
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
+from PIL import Image
 from transformers import (
-    AutoProcessor,
+    LayoutLMv3Tokenizer,
+    LayoutLMv3ImageProcessor,
+    LayoutLMv3Processor,
     AutoModelForTokenClassification,
+    AutoConfig,
     TrainingArguments,
     Trainer,
-    default_data_collator,
     set_seed,
 )
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score, classification_report
 import logging
+
+warnings.filterwarnings("ignore", message=".*unexpected key.*")
+warnings.filterwarnings("ignore", message=".*missing keys.*")
+warnings.filterwarnings("ignore", message=".*Some weights.*")
+warnings.filterwarnings("ignore", message=".*deprecated.*")
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)-8s | %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-set_seed(42)
-
-class Config:
-    train_dir = "lilt_dataset/train"
-    val_dir = "lilt_dataset/val"
-    model_name = "SCUT-DLVCLab/lilt-roberta-en-base"
-    max_seq_length = 128
-    per_device_train_batch_size = 1
-    per_device_eval_batch_size = 1
-    gradient_accumulation_steps = 8
-    learning_rate = 5e-5
-    num_train_epochs = 30
-    warmup_ratio = 0.1
-    weight_decay = 0.01
-    max_grad_norm = 1.0
-    output_dir = "lilt_invoice_model"
-    logging_dir = "./logs"
-    debug_mode = False
-    label_list = None
-    
-    @classmethod
-    def get_label2id(cls):
-        return {label: i for i, label in enumerate(cls.label_list)}
-    
-    @classmethod
-    def get_id2label(cls):
-        return {i: label for i, label in enumerate(cls.label_list)}
 
 
-def detect_labels_from_dataset(data_dir: str):
-    data_dir = Path(data_dir)
-    all_labels = set()
+# ============================================================================
+# Configuration
+# ============================================================================
+@dataclass
+class TrainingConfig:
+    train_dir: str = "lilt_dataset/train"
+    val_dir: str = "lilt_dataset/val"
+    images_dir: str = "new_form"
+    output_dir: str = "lilt_model_relations"
+    model_name: str = "SCUT-DLVCLab/lilt-roberta-en-base"
+    max_length: int = 512
+    token_labels: List[str] = field(default_factory=lambda: [
+        "O", "B-HEADER", "I-HEADER", "B-QUESTION", "I-QUESTION", "B-ANSWER", "I-ANSWER"
+    ])
+    relation_types: List[str] = field(default_factory=lambda: [
+        "no_relation", "relation_right", "relation_left", 
+        "relation_above", "relation_below", "relation_unknown"
+    ])
+    num_train_epochs: int = 30
+    per_device_train_batch_size: int = 1
+    per_device_eval_batch_size: int = 1
+    learning_rate: float = 5e-5
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+    gradient_accumulation_steps: int = 8
+    use_relation_extraction: bool = True
+    relation_loss_weight: float = 0.3
+    max_entity_pairs: int = 64
+    seed: int = 42
+    use_cuda: bool = True
+    use_token_class_weights: bool = True
+    use_relation_class_weights: bool = True
+    use_refined_labels: bool = False
+    eval_steps: int = 50
+    save_total_limit: int = 3
+
+
+# ============================================================================
+# Joint Model: Token Classification + Relation Extraction
+# ============================================================================
+class LiLTForTokenAndRelationClassification(nn.Module):
+    """Joint model compatible with LiLT checkpoint using AutoModel"""
     
-    for json_file in data_dir.glob("*.json"):
-        try:
-            with open(json_file, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
+    def __init__(self, base_model_name: str, num_token_labels: int, 
+                 num_relation_types: int, hidden_size: int = 768, 
+                 relation_dropout: float = 0.1,
+                 token_class_weights: Optional[torch.Tensor] = None,
+                 relation_class_weights: Optional[torch.Tensor] = None):
+        super().__init__()
+        
+        config = AutoConfig.from_pretrained(base_model_name, ignore_mismatched_sizes=True)
+        config.num_labels = num_token_labels
+        
+        self.base = AutoModelForTokenClassification.from_pretrained(
+            base_model_name, config=config, ignore_mismatched_sizes=True, torch_dtype=torch.float32)
+        self.config = self.base.config
+        
+        self.relation_classifier = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(relation_dropout),
+            nn.Linear(hidden_size, num_relation_types)
+        )
+        
+        self.num_token_labels = num_token_labels
+        self.num_relation_types = num_relation_types
+        self.hidden_size = hidden_size
+        
+        self.register_buffer('token_class_weights', 
+                           token_class_weights if token_class_weights is not None else torch.ones(num_token_labels))
+        self.register_buffer('relation_class_weights', 
+                           relation_class_weights if relation_class_weights is not None else torch.ones(num_relation_types))
+        self.relation_loss_weight = 0.3
+        
+    def forward(self, input_ids=None, bbox=None, attention_mask=None, 
+                pixel_values=None, labels=None, entity_pairs=None, 
+                relation_labels=None, **kwargs):
+        
+        outputs = self.base(
+            input_ids=input_ids, bbox=bbox, attention_mask=attention_mask, 
+            pixel_values=pixel_values, labels=None, output_hidden_states=True, return_dict=True)
+        
+        token_logits = outputs.logits
+        result = {'logits': token_logits}
+        
+        if labels is not None:
+            logits_len = token_logits.size(1)
+            labels_len = labels.size(1) if labels.dim() == 2 else labels.size(0)
+            if logits_len != labels_len:
+                if labels_len < logits_len:
+                    pad_len = logits_len - labels_len
+                    if labels.dim() == 1:
+                        padding = torch.full((pad_len,), -100, dtype=labels.dtype, device=labels.device)
+                        labels = torch.cat([labels, padding], dim=0)
+                    else:
+                        padding = torch.full((labels.size(0), pad_len), -100, dtype=labels.dtype, device=labels.device)
+                        labels = torch.cat([labels, padding], dim=1)
+                else:
+                    labels = labels[:, :logits_len] if labels.dim() > 1 else labels[:logits_len]
+            loss_fct = nn.CrossEntropyLoss(weight=self.token_class_weights, ignore_index=-100)
+            token_logits_flat = token_logits.view(-1, self.num_token_labels)
+            labels_flat = labels.view(-1)
+            token_loss = loss_fct(token_logits_flat, labels_flat)
+            result['token_loss'] = token_loss
+            result['loss'] = token_loss
+        
+        if entity_pairs is not None and self.training:
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states and len(outputs.hidden_states) > 0:
+                sequence_output = outputs.hidden_states[-1]
+            elif hasattr(outputs, 'last_hidden_state'):
+                sequence_output = outputs.last_hidden_state
+            else:
+                backbone_kwargs = {'input_ids': input_ids, 'bbox': bbox, 'attention_mask': attention_mask, 'output_hidden_states': True, 'return_dict': True}
+                if pixel_values is not None:
+                    backbone_kwargs['pixel_values'] = pixel_values
+                try:
+                    backbone_out = self.base.base_model(**backbone_kwargs)
+                    sequence_output = backbone_out.last_hidden_state if hasattr(backbone_out, 'last_hidden_state') else backbone_out[0]
+                except (TypeError, AttributeError):
+                    backbone_kwargs.pop('pixel_values', None)
+                    backbone_out = self.base.base_model(**backbone_kwargs)
+                    sequence_output = backbone_out.last_hidden_state if hasattr(backbone_out, 'last_hidden_state') else backbone_out[0]
             
-            entities = []
-            if "documents" in data and data["documents"]:
-                for doc in data["documents"]:
-                    if "document" in doc:
-                        entities.extend(doc["document"])
-            elif "document" in data:
-                entities = data["document"]
-            elif "entities" in data:
-                entities = data["entities"]
-            
-            for entity in entities:
-                if isinstance(entity, dict):
-                    label = str(entity.get("label", "")).strip()
-                    if label and label != "O":
-                        all_labels.add(label)
-        except Exception as e:
-            if Config.debug_mode:
-                logger.warning(f"Skipping {json_file.name}: {e}")
-            continue
+            rel_logits, rel_loss = self._compute_relation_loss(sequence_output, entity_pairs, relation_labels, attention_mask)
+            if rel_loss is not None:
+                result['relation_loss'] = rel_loss
+                result['loss'] = result.get('loss', 0) + self.relation_loss_weight * rel_loss
+        
+        return result
     
-    labels = ["O"] + sorted(all_labels)
-    logger.info(f"🔍 Detected {len(labels)} labels: {labels}")
-    return labels
+    def _compute_relation_loss(self, sequence_output: torch.Tensor, entity_pairs: List[List[Tuple[int, int]]], relation_labels: Optional[torch.Tensor], attention_mask: torch.Tensor):
+        batch_size = sequence_output.size(0)
+        max_pairs = max((len(p) for p in entity_pairs), default=0)
+        if max_pairs == 0:
+            return None, None
+        
+        cls_repr = sequence_output[:, 0, :]
+        relation_reprs, valid_mask = [], []
+        
+        for b in range(batch_size):
+            pairs = entity_pairs[b] if b < len(entity_pairs) else []
+            batch_reprs, batch_valid = [], []
+            for i in range(max_pairs):
+                if i < len(pairs) and pairs[i][0] < sequence_output.size(1):
+                    head_idx, tail_idx = pairs[i]
+                    head_idx = min(head_idx, sequence_output.size(1) - 1)
+                    tail_idx = min(tail_idx, sequence_output.size(1) - 1)
+                    head_repr = sequence_output[b, head_idx, :]
+                    tail_repr = sequence_output[b, tail_idx, :]
+                    pair_repr = torch.cat([cls_repr[b], head_repr, tail_repr], dim=-1)
+                    batch_reprs.append(pair_repr)
+                    batch_valid.append(1)
+                else:
+                    batch_reprs.append(torch.zeros(self.hidden_size * 3, device=sequence_output.device))
+                    batch_valid.append(0)
+            relation_reprs.append(torch.stack(batch_reprs))
+            valid_mask.append(torch.tensor(batch_valid, device=sequence_output.device))
+        
+        relation_reprs = torch.stack(relation_reprs)
+        valid_mask = torch.stack(valid_mask)
+        relation_logits = self.relation_classifier(relation_reprs)
+        
+        relation_loss = None
+        if relation_labels is not None:
+            loss_fct = nn.CrossEntropyLoss(weight=self.relation_class_weights, reduction='none')
+            flat_logits = relation_logits.view(-1, self.num_relation_types)
+            flat_labels = relation_labels.view(-1)
+            flat_valid = valid_mask.view(-1)
+            per_pair_loss = loss_fct(flat_logits, flat_labels)
+            relation_loss = (per_pair_loss * flat_valid).sum() / (flat_valid.sum() + 1e-8)
+        
+        return relation_logits, relation_loss
 
 
-class LILTDataset(Dataset):
-    def __init__(self, data_dir: str, processor, label2id: dict):
+# ============================================================================
+# Dataset — FIXED BIO TAGGING
+# ============================================================================
+class LiLTInvoiceRelationDataset(Dataset):
+    def __init__(self, data_dir: str, images_dir: str, processor: LayoutLMv3Processor, token_labels: List[str], relation_types: List[str], max_length: int = 512, max_entity_pairs: int = 64, use_refined_labels: bool = False):
         self.data_dir = Path(data_dir)
+        self.images_dir = Path(images_dir)
         self.processor = processor
-        self.label2id = label2id
-        self.id2label = {v: k for k, v in label2id.items()}
-        self.examples = []
-        
-        json_files = list(self.data_dir.glob("*.json"))
-        if not json_files:
-            raise ValueError(f"No JSON files found in {data_dir}")
-        
-        logger.info(f"📚 Loading {len(json_files)} annotation files from {data_dir}...")
-        
-        valid_count = 0
-        skipped_count = 0
-        
+        self.token_labels = token_labels
+        self.relation_types = relation_types
+        self.max_length = max_length
+        self.max_entity_pairs = max_entity_pairs
+        self.use_refined_labels = use_refined_labels
+        self.token_label2id = {l.strip(): i for i, l in enumerate(token_labels)}
+        self.relation_type2id = {t.strip(): i for i, t in enumerate(relation_types)}
+        self.id2token_label = {i: l for l, i in self.token_label2id.items()}
+        self.examples = self._load_data()
+        logger.info(f"✅ Loaded {len(self.examples)} examples from {data_dir}")
+    
+    def _load_data(self) -> List[Dict]:
+        examples = []
+        json_files = [f for f in self.data_dir.glob("*.json") if f.name not in ['index.json', 'metadata.json']]
         for json_file in json_files:
             try:
-                with open(json_file, "r", encoding="utf-8-sig") as f:
+                with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
-                img_path = None
-                for ext in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG']:
-                    candidate = self.data_dir / (json_file.stem + ext)
-                    if candidate.exists():
-                        img_path = candidate
-                        break
-                
-                if not img_path:
-                    if Config.debug_mode:
-                        logger.warning(f"  ⚠️ Image not found for {json_file.name}")
-                    skipped_count += 1
-                    continue
-                
-                entities = []
-                if "documents" in data and data["documents"]:
-                    for doc in data["documents"]:
-                        if "document" in doc:
-                            entities.extend(doc["document"])
-                elif "document" in data:
-                    entities = data["document"]
-                elif "entities" in data:
-                    entities = data["entities"]
-                elif isinstance(data, list):
-                    entities = data
-                
-                if not entities:
-                    if Config.debug_mode:
-                        logger.warning(f"  ⚠️ No entities in {json_file.name}")
-                    skipped_count += 1
-                    continue
-                
-                words = []
-                boxes = []
-                word_labels = []
-                
-                for entity in entities:
-                    if not isinstance(entity, dict):
-                        continue
-                    
-                    text_raw = entity.get("text")
-                    if text_raw is None or str(text_raw).strip() == "":
-                        continue
-                    
-                    text_str = str(text_raw).strip()
-                    if not text_str:
-                        continue
-                    
-                    label_raw = entity.get("label", "O")
-                    label_str = str(label_raw).strip() if label_raw else "O"
-                    
-                    bbox = entity.get("box") or entity.get("bbox", [0, 0, 100, 100])
-                    if isinstance(bbox, list) and len(bbox) >= 4:
-                        if max(bbox) <= 1.0:
-                            bbox = [int(coord * 1000) for coord in bbox[:4]]
-                        else:
-                            bbox = bbox[:4]
-                    else:
-                        bbox = [0, 0, 100, 100]
-                    
-                    tokens = text_str.split()
-                    for token in tokens:
-                        token_str = str(token).strip()
-                        if not token_str:
-                            continue
-                        words.append(token_str)
-                        word_labels.append(label_str)
-                        boxes.append(bbox)
-                
-                if not words:
-                    if Config.debug_mode:
-                        logger.warning(f"  ⚠️ No valid words in {json_file.name}")
-                    skipped_count += 1
-                    continue
-                
-                if not all(isinstance(w, str) and w.strip() for w in words):
-                    if Config.debug_mode:
-                        problematic = [w for w in words if not (isinstance(w, str) and w.strip())]
-                        logger.warning(f"  ⚠️ Non-string words in {json_file.name}: {problematic[:3]}")
-                    skipped_count += 1
-                    continue
-                
-                self.examples.append({
-                    "image_path": str(img_path),
-                    "words": words,
-                    "boxes": boxes,
-                    "word_labels": word_labels,
-                })
-                valid_count += 1
-                
+                tasks = data if isinstance(data, list) else [data]
+                for task in tasks:
+                    example = self._parse_task(task)
+                    if example:
+                        examples.append(example)
             except Exception as e:
-                if Config.debug_mode:
-                    logger.warning(f"  ⚠️ Error processing {json_file.name}: {e}")
-                skipped_count += 1
-                continue
-        
-        logger.info(f"✅ Loaded {valid_count} valid examples ({skipped_count} skipped)")
-        
-        if valid_count == 0:
-            raise ValueError("No valid examples found!")
-        elif valid_count < 20:
-            logger.warning(f"⚠️ VERY SMALL DATASET ({valid_count} examples). Model may not learn effectively!")
+                logger.warning(f"⚠️ Failed to parse {json_file.name}: {e}")
+        return examples
     
-    def __len__(self):
-        return len(self.examples)
-    
-    def normalize_box(self, box, width, height):
-        """Normalize bbox to 0-1000 scale"""
-        return [
-            max(0, min(1000, int(1000 * (box[0] / width)))),
-            max(0, min(1000, int(1000 * (box[1] / height)))),
-            max(0, min(1000, int(1000 * (box[2] / width)))),
-            max(0, min(1000, int(1000 * (box[3] / height)))),
-        ]
-
-    def __getitem__(self, idx):
-        example = self.examples[idx]
-        
+    def _parse_task(self, task: Dict) -> Optional[Dict]:
         try:
-            # Load image
-            image = Image.open(example["image_path"]).convert("RGB")
-            width, height = image.size
+            task = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in task.items()}
+            image_path = None
+            for key in ['image_path', 'image']:
+                if key in task and task[key]:
+                    rel_path = str(task[key]).strip()
+                    image_name = Path(rel_path).name
+                    if '-' in image_name and len(image_name.split('-')[0]) <= 10:
+                        image_name = image_name.split('-', 1)[-1]
+                    candidate = self.images_dir / image_name
+                    if candidate.exists():
+                        image_path = candidate
+                        break
+            if not image_path or not image_path.exists():
+                return None
+            image = Image.open(image_path).convert("RGB")
+            img_w, img_h = image.size
+            tokens = task.get('tokens', task.get('tokens ', []))
+            if not tokens:
+                return None
             
-            # Clean words
-            words = [str(w).strip() for w in example["words"]]
-            words = [w for w in words if w]
+            # Ensure tokens are sorted in reading order (top-to-bottom, left-to-right)
+            tokens.sort(key=lambda t: (t.get('center_y', t['box'][1]), t.get('center_x', t['box'][0])))
+            
+            id_to_sorted_idx = {}
+            for idx, token in enumerate(tokens):
+                token = {k.strip(): v for k, v in token.items()}
+                token_id = token.get('id')
+                if token_id is not None:
+                    id_to_sorted_idx[token_id] = idx
+            
+            words, boxes, token_labels = [], [], []
+            prev_label = None  # track previous token's base label for BIO
+            
+            for token in tokens:
+                token = {k.strip(): v for k, v in token.items()}
+                # Choose label source
+                label = str(token.get('refined_label' if self.use_refined_labels and 'refined_label' in token else 'label', 'O')).strip().upper()
+                box = token.get('box', [0, 0, 0, 0])
+                text = str(token.get('text', '')).strip()
+                
+                norm_box = [
+                    max(0, min(1000, int(1000 * box[0] / img_w))),
+                    max(0, min(1000, int(1000 * box[1] / img_h))),
+                    max(0, min(1000, int(1000 * box[2] / img_w))),
+                    max(0, min(1000, int(1000 * box[3] / img_h)))
+                ]
+                
+                if not text or text.isspace():
+                    text = '[TOKEN]'
+                words.append(text)
+                boxes.append(norm_box)
+                
+                # ----- CORRECT BIO ASSIGNMENT -----
+                if label == 'O':
+                    bio = 'O'
+                    prev_label = None
+                else:
+                    # label is one of HEADER, QUESTION, ANSWER
+                    if prev_label == label:
+                        # same entity continues → I- tag
+                        bio = f"I-{label}"
+                    else:
+                        # new entity starts → B- tag
+                        bio = f"B-{label}"
+                    prev_label = label
+                
+                label_id = self.token_label2id.get(bio, self.token_label2id['O'])
+                token_labels.append(label_id)
+            
             if not words:
-                raise ValueError(f"Example {idx}: No valid words after cleaning")
+                return None
             
-            boxes = example["boxes"]
-            word_labels = example["word_labels"]
+            relations = task.get('relations', task.get('relations ', []))
+            entity_pairs, relation_label_ids = [], []
+            for rel in relations:
+                rel = {k.strip(): v for k, v in rel.items()}
+                head_orig, tail_orig = rel.get('head'), rel.get('tail')
+                rel_type = str(rel.get('type', 'relation')).strip()
+                direction = str(rel.get('direction', '')).strip()
+                if head_orig not in id_to_sorted_idx or tail_orig not in id_to_sorted_idx:
+                    continue
+                head_idx, tail_idx = id_to_sorted_idx[head_orig], id_to_sorted_idx[tail_orig]
+                if head_idx == tail_idx:
+                    continue
+                rel_key = f"{rel_type}_{direction}".lower().replace(' ', '_') if direction else rel_type.lower()
+                rel_id = self.relation_type2id.get(rel_key, self.relation_type2id.get('relation_right', 1))
+                entity_pairs.append((head_idx, tail_idx))
+                relation_label_ids.append(rel_id)
             
-            # Normalize boxes
-            normalized_boxes = [self.normalize_box(b, width, height) for b in boxes]
+            # Pad to max_entity_pairs
+            while len(entity_pairs) < self.max_entity_pairs:
+                entity_pairs.append((0, 0))
+                relation_label_ids.append(self.relation_type2id['no_relation'])
+            entity_pairs = entity_pairs[:self.max_entity_pairs]
+            relation_label_ids = relation_label_ids[:self.max_entity_pairs]
             
-            # Convert word labels to IDs
-            word_label_ids = [
-                self.label2id.get(str(label).strip(), self.label2id["O"])
-                for label in word_labels
-            ]
-            
-            # ✅ CRITICAL FIX: Pass words as LIST (not joined string)
-            # LayoutLMv3Processor expects list of words for alignment with boxes/labels
-            text = words  # List of words, NOT joined string
-            
-            # ✅ Use processor with correct parameters
-            encoding = self.processor(
-                image,                          # Single PIL Image
-                text=text,                      # ✅ LIST of words (not string)
-                boxes=normalized_boxes,         # Word-level boxes
-                word_labels=word_label_ids,     # Word-level label IDs
-                padding="max_length",
-                truncation=True,
-                max_length=Config.max_seq_length,
-                return_tensors="pt",
-            )
-            
-            # ✅ Ensure all required fields are present
-            required_keys = ["pixel_values", "input_ids", "attention_mask", "bbox"]
-            for key in required_keys:
-                if key not in encoding:
-                    raise ValueError(f"Missing required key '{key}' in encoding")
-            
-            # Remove batch dimension
             return {
-                "pixel_values": encoding["pixel_values"].squeeze(0),
-                "input_ids": encoding["input_ids"].squeeze(0),
-                "attention_mask": encoding["attention_mask"].squeeze(0),
-                "bbox": encoding["bbox"].squeeze(0),
-                "labels": encoding["labels"].squeeze(0).to(torch.long),
+                'image_path': str(image_path),
+                'words': words, 'boxes': boxes, 'token_labels': token_labels,
+                'entity_pairs': entity_pairs, 'relation_labels': relation_label_ids,
+                'task_id': task.get('id', 'unknown'),
             }
-            
         except Exception as e:
-            logger.error(f"❌ Error in example {idx} ({example.get('image_path', 'unknown')}): {e}")
-            if Config.debug_mode:
-                logger.error(f"  Words ({len(words)}): {words[:10]}")
-                logger.error(f"  Boxes: {len(normalized_boxes)}, Word labels: {len(word_label_ids)}")
-                logger.error(f"  Text type: {type(text)}, Text length: {len(text) if isinstance(text, list) else 'N/A'}")
-            raise
-            
-def compute_metrics(p):
-    predictions, labels = p
-    predictions = np.argmax(predictions, axis=2)
+            logger.warning(f"⚠️ Parse error: {e}", exc_info=True)
+            return None
     
-    flat_preds = []
-    flat_labels = []
+    def __len__(self): return len(self.examples)
     
-    for pred_seq, label_seq in zip(predictions, labels):
-        for pred_id, label_id in zip(pred_seq, label_seq):
-            if label_id != -100:
-                flat_preds.append(pred_id)
-                flat_labels.append(label_id)
+    def __getitem__(self, idx: int) -> Dict:
+        example = self.examples[idx]
+        try:
+            image = Image.open(example['image_path']).convert("RGB")
+            encoding = self.processor(images=image, text=example['words'], boxes=example['boxes'], word_labels=example['token_labels'], padding="max_length", truncation=True, max_length=self.max_length, return_tensors="pt")
+            result = {}
+            for k, v in encoding.items():
+                if isinstance(v, torch.Tensor) and v.size(0) == 1:
+                    result[k] = v.squeeze(0)
+                else:
+                    result[k] = v
+            result['entity_pairs'] = torch.tensor(example['entity_pairs'], dtype=torch.long)
+            result['relation_labels'] = torch.tensor(example['relation_labels'], dtype=torch.long)
+            result['task_id'] = example['task_id']
+            return result
+        except Exception as e:
+            logger.error(f"❌ Getitem error: {e}", exc_info=True)
+            return self._dummy()
     
-    if not flat_labels:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
-    
-    pred_strs = [Config.id2label.get(p, "O") for p in flat_preds]
-    label_strs = [Config.id2label.get(l, "O") for l in flat_labels]
-    
-    non_o_labels = [l for l in Config.label_list if l != "O"]
-    
-    if non_o_labels:
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            label_strs, pred_strs, 
-            labels=non_o_labels, 
-            average='micro',
-            zero_division=0
-        )
+    def _dummy(self) -> Dict:
+        return {'pixel_values': torch.zeros(3, 224, 224), 'input_ids': torch.zeros(self.max_length, dtype=torch.long), 'attention_mask': torch.zeros(self.max_length, dtype=torch.long), 'bbox': torch.zeros(self.max_length, 4, dtype=torch.long), 'labels': torch.full((self.max_length,), -100, dtype=torch.long), 'entity_pairs': torch.zeros((self.max_entity_pairs, 2), dtype=torch.long), 'relation_labels': torch.zeros(self.max_entity_pairs, dtype=torch.long), 'task_id': 'dummy'}
+
+
+# ============================================================================
+# Data Collator
+# ============================================================================
+class RelationDataCollator:
+    def __init__(self, processor: LayoutLMv3Processor, max_entity_pairs: int = 64):
+        self.processor = processor
+        self.max_entity_pairs = max_entity_pairs
+    def __call__(self, features: List[Dict]) -> Dict:
+        batch = {}
+        relation_fields = ['entity_pairs', 'relation_labels', 'task_id']
+        for key in features[0].keys():
+            if key in relation_fields:
+                batch[key] = [f[key] for f in features]
+            else:
+                batch[key] = torch.stack([f[key] for f in features], dim=0)
+        batch['entity_pairs'] = torch.stack(batch['entity_pairs'], dim=0)
+        batch['relation_labels'] = torch.stack(batch['relation_labels'], dim=0)
+        return batch
+
+
+# ============================================================================
+# Metrics - FIXED for all numpy array issues
+# ============================================================================
+def compute_token_metrics(eval_pred, id2label: Dict[int, str]):
+    if hasattr(eval_pred, 'predictions'):
+        predictions = eval_pred.predictions
+        labels = eval_pred.label_ids
     else:
-        precision = recall = f1 = 0.0
-    
-    accuracy = accuracy_score(label_strs, pred_strs)
-    
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
+        predictions, labels = eval_pred
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+    predictions = np.argmax(predictions, axis=2)
+    true_labels, true_preds = [], []
+    if isinstance(labels, (list, tuple)):
+        for lbl_seq, pred_seq in zip(labels, predictions):
+            lbl_arr = np.asarray(lbl_seq) if not isinstance(lbl_seq, np.ndarray) else lbl_seq
+            pred_arr = np.asarray(pred_seq) if not isinstance(pred_seq, np.ndarray) else pred_seq
+            for lbl, pred in zip(lbl_arr.ravel(), pred_arr.ravel()):
+                if lbl != -100:
+                    true_labels.append(int(lbl))
+                    true_preds.append(int(pred))
+    else:
+        labels = np.asarray(labels)
+        labels_flat = labels.ravel()
+        predictions_flat = predictions.ravel()
+        mask = labels_flat != -100
+        true_labels = labels_flat[mask].tolist()
+        true_preds = predictions_flat[mask].tolist()
+    if not true_labels:
+        return {'precision': 0, 'recall': 0, 'f1': 0, 'accuracy': 0}
+    precision, recall, f1, _ = precision_recall_fscore_support(true_labels, true_preds, average='weighted', zero_division=0)
+    accuracy = accuracy_score(true_labels, true_preds)
+    metrics = {'precision': precision, 'recall': recall, 'f1': f1, 'accuracy': accuracy}
+    unique_labels = sorted(set(true_labels))
+    present_target_names = [id2label.get(i, str(i)) for i in unique_labels]
+    try:
+        report = classification_report(true_labels, true_preds, labels=unique_labels, target_names=present_target_names, output_dict=True, zero_division=0)
+        for label_name in ['B-HEADER', 'B-QUESTION', 'B-ANSWER', 'O']:
+            if label_name in report:
+                metrics[f'{label_name}_f1'] = report[label_name]['f1-score']
+    except ValueError as e:
+        logger.warning(f"⚠️ classification_report failed: {e}, using basic metrics only")
+    return metrics
 
 
-def debug_label_distribution(dataset, name="Dataset"):
-    """Debug helper to show label distribution BEFORE training"""
-    logger.info(f"\n🔍 {name} Label Distribution Check:")
-    total_tokens = 0
-    label_counts = {}
-    
-    for i in range(min(5, len(dataset))):
-        try:
-            item = dataset[i]
-            labels = item["labels"].numpy()
-            valid_labels = labels[labels != -100]
-            
-            logger.info(f"  Example {i}: {len(valid_labels)} valid tokens")
-            total_tokens += len(valid_labels)
-            
-            for lid in valid_labels:
-                label_name = Config.id2label.get(lid, f"ID{lid}")
-                label_counts[label_name] = label_counts.get(label_name, 0) + 1
-                
-        except Exception as e:
-            logger.warning(f"  ⚠️ Example {i} failed: {e}")
-            continue
-    
-    if total_tokens == 0:
-        logger.error(f"❌ {name} has NO valid tokens with labels != -100!")
-        return False
-    
-    logger.info(f"  Total valid tokens: {total_tokens}")
-    for label, count in sorted(label_counts.items(), key=lambda x: x[1], reverse=True):
-        pct = (count / total_tokens * 100)
-        logger.info(f"    {label:20s}: {count:4d} ({pct:5.1f}%)")
-    
-    non_o_count = sum(count for label, count in label_counts.items() if label != "O")
-    if non_o_count == 0:
-        logger.error(f"❌ {name} has NO entity labels (only 'O')! Training will fail.")
-        return False
-    
-    return True
+def compute_token_class_weights(dataset: LiLTInvoiceRelationDataset) -> torch.Tensor:
+    counter = Counter()
+    for ex in dataset.examples:
+        for lbl_id in ex['token_labels']:
+            counter[lbl_id] += 1
+    num_classes = len(dataset.token_labels)
+    for i in range(num_classes):
+        if i not in counter:
+            counter[i] = 1
+    total = sum(counter.values())
+    weights = torch.tensor([total / (counter[i] * num_classes) for i in range(num_classes)], dtype=torch.float)
+    weights = weights / weights.mean()
+    label_names = dataset.token_labels
+    weight_info = {label_names[i]: round(float(weights[i]), 3) for i in range(num_classes)}
+    logger.info(f"⚖️ Token class weights: {weight_info}")
+    return weights
 
 
-from transformers import LayoutLMv3Processor, LayoutLMv3Tokenizer, LayoutLMv3ImageProcessor
+def compute_relation_class_weights(dataset: LiLTInvoiceRelationDataset) -> torch.Tensor:
+    counter = Counter()
+    for ex in dataset.examples:
+        for rel_id in ex['relation_labels']:
+            counter[rel_id] += 1
+    num_classes = len(dataset.relation_types)
+    for i in range(num_classes):
+        if i not in counter:
+            counter[i] = 1
+    total = sum(counter.values())
+    weights = torch.tensor([total / (counter[i] * num_classes) for i in range(num_classes)], dtype=torch.float)
+    weights = weights / weights.mean()
+    label_names = dataset.relation_types
+    weight_info = {label_names[i]: round(float(weights[i]), 3) for i in range(num_classes)}
+    logger.info(f"⚖️ Relation class weights: {weight_info}")
+    return weights
 
-def train_lilt():
-    logger.info("="*70)
-    logger.info("🚀 STARTING LILT TRAINING (lilt-roberta-en-base)")
-    logger.info("="*70)
-    logger.info(f"   Model: {Config.model_name}")
-    logger.info(f"   Architecture: LayoutLMv3-based (LiLT uses LayoutLMv3)")
-    logger.info(f"   Processor: LayoutLMv3Processor (explicit)")
-    logger.info(f"   Label alignment: AUTOMATIC via word_labels parameter")
-    logger.info("="*70)
-    
-    # Detect labels
-    logger.info("\n🔍 Auto-detecting labels from training data...")
+
+# ============================================================================
+# Custom Trainer
+# ============================================================================
+class JointTrainer(Trainer):
+    def __init__(self, *args, config: TrainingConfig = None, id2token_label: Dict = None, **kwargs):
+        kwargs.pop('tokenizer', None)
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.id2token_label = id2token_label or {}
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        is_training = self.model.training
+        entity_pairs = inputs.pop('entity_pairs', None)
+        relation_labels = inputs.pop('relation_labels', None)
+        model.relation_loss_weight = self.config.relation_loss_weight
+        outputs = model(input_ids=inputs.get('input_ids'), bbox=inputs.get('bbox'), attention_mask=inputs.get('attention_mask'), pixel_values=inputs.get('pixel_values'), labels=inputs.get('labels'), entity_pairs=entity_pairs if is_training else None, relation_labels=relation_labels if is_training else None)
+        loss = outputs.get('loss')
+        if return_outputs:
+            return loss, {'logits': outputs.get('logits')}
+        return loss
+
+
+# ============================================================================
+# Training Function
+# ============================================================================
+def train(config: TrainingConfig):
+    set_seed(config.seed)
+    device = torch.device("cuda" if config.use_cuda and torch.cuda.is_available() else "cpu")
+    logger.info(f"🚀 Device: {device} | Relations: {config.use_relation_extraction}")
+    for d in [config.train_dir, config.val_dir, config.images_dir]:
+        if not Path(d).exists():
+            logger.error(f"❌ Missing: {d}")
+            return None
+    Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+    logger.info(f"\n📥 Loading processor...")
+    tokenizer = LayoutLMv3Tokenizer.from_pretrained(config.model_name, add_prefix_space=True)
+    image_processor = LayoutLMv3ImageProcessor.from_pretrained("microsoft/layoutlmv3-base", apply_ocr=False)
+    processor = LayoutLMv3Processor(image_processor=image_processor, tokenizer=tokenizer)
+    logger.info(f"\n📚 Loading datasets...")
+    train_dataset = LiLTInvoiceRelationDataset(config.train_dir, config.images_dir, processor, config.token_labels, config.relation_types, config.max_length, config.max_entity_pairs, use_refined_labels=config.use_refined_labels)
+    val_dataset = LiLTInvoiceRelationDataset(config.val_dir, config.images_dir, processor, config.token_labels, config.relation_types, config.max_length, config.max_entity_pairs, use_refined_labels=config.use_refined_labels)
+    if len(train_dataset) == 0:
+        logger.error("❌ No training examples!")
+        return None
+    logger.info(f"✅ Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    token_class_weights = None
+    if config.use_token_class_weights:
+        token_class_weights = compute_token_class_weights(train_dataset).to(device)
+    relation_class_weights = None
+    if config.use_relation_extraction and config.use_relation_class_weights:
+        relation_class_weights = compute_relation_class_weights(train_dataset).to(device)
+    logger.info(f"\n🤖 Loading joint model...")
+    model = LiLTForTokenAndRelationClassification(base_model_name=config.model_name, num_token_labels=len(config.token_labels), num_relation_types=len(config.relation_types), token_class_weights=token_class_weights, relation_class_weights=relation_class_weights)
+    logger.info(f"✅ Model loaded ({sum(p.numel() for p in model.parameters()):,} params)")
+    total_steps = len(train_dataset) * config.num_train_epochs // (config.per_device_train_batch_size * config.gradient_accumulation_steps)
+    warmup_steps = int(total_steps * config.warmup_ratio)
+    training_args = TrainingArguments(output_dir=config.output_dir, num_train_epochs=config.num_train_epochs, per_device_train_batch_size=config.per_device_train_batch_size, per_device_eval_batch_size=config.per_device_eval_batch_size, learning_rate=config.learning_rate, weight_decay=config.weight_decay, warmup_steps=warmup_steps, lr_scheduler_type='linear', gradient_accumulation_steps=config.gradient_accumulation_steps, eval_strategy="steps", eval_steps=config.eval_steps, save_strategy="steps", save_steps=config.eval_steps, load_best_model_at_end=True, metric_for_best_model="eval_f1", greater_is_better=True, logging_steps=10, save_total_limit=config.save_total_limit, fp16=torch.cuda.is_available(), dataloader_num_workers=0, report_to="none", seed=config.seed, remove_unused_columns=False, prediction_loss_only=False)
+    data_collator = RelationDataCollator(processor, config.max_entity_pairs)
+    trainer_kwargs = dict(model=model, args=training_args, config=config, id2token_label=train_dataset.id2token_label, train_dataset=train_dataset, eval_dataset=val_dataset, data_collator=data_collator, compute_metrics=lambda x: compute_token_metrics(x, train_dataset.id2token_label))
     try:
-        Config.label_list = detect_labels_from_dataset(Config.train_dir)
-    except Exception as e:
-        logger.error(f"❌ Failed to detect labels: {e}")
-        sys.exit(1)
-    
-    if len(Config.label_list) <= 1:
-        logger.error("❌ No entity labels found!")
-        sys.exit(1)
-    
-    Config.id2label = Config.get_id2label()
-    Config.label2id = Config.get_label2id()
-    
-    # Create directories
-    Path(Config.output_dir).mkdir(parents=True, exist_ok=True)
-    Path(Config.logging_dir).mkdir(parents=True, exist_ok=True)
-    
-    # ✅ FIX: Use LayoutLMv3Processor explicitly
-    logger.info("\n📥 Loading LayoutLMv3Processor...")
-    try:
-        # Load tokenizer and image processor separately
-        tokenizer = LayoutLMv3Tokenizer.from_pretrained(
-            Config.model_name,
-        )
-        
-        # Note: LiLT uses LayoutLMv3's image processor
-        # We use microsoft/layoutlmv3-base as the source for image processor
-        image_processor = LayoutLMv3ImageProcessor.from_pretrained(
-            "microsoft/layoutlmv3-base",  # Source of image processing config
-            apply_ocr=False,
-        )
-        
-        # Create the processor with both components
-        processor = LayoutLMv3Processor(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-        )
-        
-        logger.info("✅ LayoutLMv3Processor loaded successfully")
-        logger.info(f"   Tokenizer class: {tokenizer.__class__.__name__}")
-        logger.info(f"   Image processor class: {image_processor.__class__.__name__}")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to load processor: {e}")
-        
-        # Fallback: Try using AutoProcessor but check if it's the right type
-        logger.warning("⚠️ Trying AutoProcessor as fallback...")
-        try:
-            processor = AutoProcessor.from_pretrained(
-                Config.model_name,
-                apply_ocr=False,
-            )
-            logger.info(f"   AutoProcessor loaded: {processor.__class__.__name__}")
-            
-            # Check if it has the required method
-            if not hasattr(processor, 'image_processor'):
-                logger.error("❌ Loaded processor doesn't have image_processor attribute!")
-                raise ValueError("Wrong processor type loaded")
-                
-        except Exception as e2:
-            logger.error(f"❌ Fallback also failed: {e2}")
-            logger.error("\n💡 TROUBLESHOOTING:")
-            logger.error("   1. Install latest transformers: pip install --upgrade transformers")
-            logger.error("   2. Clear cache: rm -rf ~/.cache/huggingface/hub/")
-            logger.error("   3. Try specific version: pip install transformers==4.40.0")
-            logger.error("   4. Check model compatibility at: https://huggingface.co/SCUT-DLVCLab/lilt-roberta-en-base")
-            sys.exit(1)
-    
-    # ✅ ADD THIS SECTION: Load datasets
-    logger.info("\n📚 Loading datasets...")
-    try:
-        train_dataset = LILTDataset(Config.train_dir, processor, Config.label2id)
-        val_dataset = LILTDataset(Config.val_dir, processor, Config.label2id)
-        
-        if len(train_dataset) == 0 or len(val_dataset) == 0:
-            raise ValueError("No valid examples found!")
-            
-        logger.info(f"✅ Train: {len(train_dataset)} examples | Val: {len(val_dataset)} examples")
-        
-        # Validate label distribution
-        if not debug_label_distribution(train_dataset, "TRAIN"):
-            logger.error("❌ Training dataset invalid. Aborting.")
-            sys.exit(1)
-        if not debug_label_distribution(val_dataset, "VALIDATION"):
-            logger.warning("⚠️ Validation set has no entity labels - metrics will be low")
-        
-    except Exception as e:
-        logger.error(f"❌ Dataset loading failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # ✅ ADD THIS SECTION: Load model
-    logger.info("\n🧠 Loading LiLT model...")
-    try:
-        model = AutoModelForTokenClassification.from_pretrained(
-            Config.model_name,
-            num_labels=len(Config.label_list),
-            id2label=Config.id2label,
-            label2id=Config.label2id,
-            ignore_mismatched_sizes=True,
-        )
-        param_count = sum(p.numel() for p in model.parameters())
-        logger.info(f"✅ Model loaded ({param_count:,} parameters)")
-        logger.info(f"   Num labels: {len(Config.label_list)}")
-    except Exception as e:
-        logger.error(f"❌ Model loading failed: {e}")
-        sys.exit(1)
-    
-    # Training args
-    training_args = TrainingArguments(
-        output_dir=Config.output_dir,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        logging_dir=Config.logging_dir,
-        logging_steps=10,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_f1",
-        greater_is_better=True,
-        
-        per_device_train_batch_size=Config.per_device_train_batch_size,
-        per_device_eval_batch_size=Config.per_device_eval_batch_size,
-        gradient_accumulation_steps=Config.gradient_accumulation_steps,
-        
-        learning_rate=Config.learning_rate,
-        num_train_epochs=Config.num_train_epochs,
-        warmup_ratio=Config.warmup_ratio,
-        weight_decay=Config.weight_decay,
-        max_grad_norm=Config.max_grad_norm,
-        
-        fp16=torch.cuda.is_available(),
-        dataloader_num_workers=0,
-        report_to="none",
-        seed=42,
-    )
-    
-    # Trainer
-    trainer = Trainer(
-        model=model,  # Now this variable is defined!
-        args=training_args,
-        train_dataset=train_dataset,  # Now this variable is defined!
-        eval_dataset=val_dataset,     # Now this variable is defined!
-        processing_class=processor,
-        data_collator=default_data_collator,
-        compute_metrics=compute_metrics,
-    )
-    
-    # Train
-    logger.info("\n" + "="*70)
-    logger.info("🔥 STARTING TRAINING")
-    logger.info("="*70)
-    
-    try:
-        train_result = trainer.train()
-        logger.info("\n✅ Training completed successfully")
-    except Exception as e:
-        logger.error(f"❌ Training failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # Save
-    logger.info("\n💾 Saving final model and processor...")
-    trainer.save_model(Config.output_dir)
-    processor.save_pretrained(Config.output_dir)
-    
-    with open(Path(Config.output_dir) / "label_map.json", "w", encoding="utf-8") as f:
-        json.dump(Config.id2label, f, indent=2, ensure_ascii=False)
-    
-    with open(Path(Config.output_dir) / "training_config.json", "w") as f:
-        json.dump({
-            "model_name": Config.model_name,
-            "max_seq_length": Config.max_seq_length,
-            "label_list": Config.label_list,
-            "num_train_epochs": Config.num_train_epochs,
-            "learning_rate": Config.learning_rate,
-        }, f, indent=2)
-    
-    logger.info("\n" + "="*70)
-    logger.info("✅ TRAINING COMPLETE")
-    logger.info("="*70)
-    logger.info(f"   Model saved to: {Config.output_dir}")
-    logger.info(f"   Labels: {Config.label_list}")
-    logger.info(f"   Best F1: {trainer.state.best_metric:.4f}" if hasattr(trainer.state, 'best_metric') else "   Best F1: N/A")
-    logger.info("="*70)
+        trainer_kwargs['processing_class'] = processor
+    except TypeError:
+        pass
+    trainer = JointTrainer(**trainer_kwargs)
+    logger.info(f"\n{'='*60}\n🔥 STARTING TRAINING\n{'='*60}")
+    train_result = trainer.train()
+    logger.info(f"\n💾 Saving model and label maps...")
+    trainer.save_model(config.output_dir)
+    processor.save_pretrained(config.output_dir)
+    label_maps = {'label_map': {str(i): l for i, l in enumerate(config.token_labels)}, 'relation_label_map': {str(i): t for i, t in enumerate(config.relation_types)}, 'config': {'token_labels': config.token_labels, 'relation_types': config.relation_types, 'model_name': config.model_name}}
+    with open(Path(config.output_dir) / "label_map.json", 'w') as f:
+        json.dump(label_maps['label_map'], f, indent=2)
+    with open(Path(config.output_dir) / "relation_label_map.json", 'w') as f:
+        json.dump(label_maps['relation_label_map'], f, indent=2)
+    with open(Path(config.output_dir) / "label_maps.json", 'w') as f:
+        json.dump(label_maps, f, indent=2)
+    logger.info(f"\n📊 Final Training Results:")
+    for k, v in train_result.metrics.items():
+        if isinstance(v, float): logger.info(f"   {k}: {v:.4f}")
+    logger.info(f"\n🔍 Running final evaluation...")
+    eval_result = trainer.evaluate()
+    for k, v in eval_result.items():
+        if isinstance(v, float): logger.info(f"   {k}: {v:.4f}")
+    logger.info(f"\n✅ Done! Model saved to: {config.output_dir}")
+    return trainer
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="LiLT Invoice Training — Fixed")
+    parser.add_argument("--train_dir", default="lilt_dataset10/train")
+    parser.add_argument("--val_dir", default="lilt_dataset10/val")
+    parser.add_argument("--images_dir", default="new_form")
+    parser.add_argument("--output_dir", default="lilt_model_10")
+    parser.add_argument("--model_name", default="SCUT-DLVCLab/lilt-roberta-en-base")
+    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=130)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--relation_loss_weight", type=float, default=0.3)
+    parser.add_argument("--max_entity_pairs", type=int, default=64)
+    parser.add_argument("--no_relations", action="store_true")
+    parser.add_argument("--no_token_class_weights", action="store_true")
+    parser.add_argument("--no_relation_class_weights", action="store_true")
+    parser.add_argument("--use_refined_labels", action="store_true")
+    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_cuda", action="store_true")
+    args = parser.parse_args()
+    config = TrainingConfig(train_dir=args.train_dir, val_dir=args.val_dir, images_dir=args.images_dir, output_dir=args.output_dir, model_name=args.model_name, max_length=args.max_length, num_train_epochs=args.epochs, per_device_train_batch_size=args.batch_size, learning_rate=args.learning_rate, warmup_ratio=args.warmup_ratio, weight_decay=args.weight_decay, gradient_accumulation_steps=args.gradient_accumulation_steps, relation_loss_weight=args.relation_loss_weight, max_entity_pairs=args.max_entity_pairs, use_relation_extraction=not args.no_relations, seed=args.seed, use_cuda=not args.no_cuda, use_token_class_weights=not args.no_token_class_weights, use_relation_class_weights=not args.no_relation_class_weights, use_refined_labels=args.use_refined_labels, eval_steps=args.eval_steps)
+    print("="*70)
+    print(f"🧾 LiLT Invoice Training — Fixed")
+    print("="*70)
+    print(f"📁 Train: {config.train_dir} | Val: {config.val_dir}")
+    print(f"🖼️  Images: {config.images_dir}")
+    print(f"🤖 Model: {config.model_name}")
+    print(f"⏱️  Epochs: {config.num_train_epochs} | LR: {config.learning_rate}")
+    print(f"🔗 Relations: {config.use_relation_extraction} (weight: {config.relation_loss_weight})")
+    print(f"⚖️  Token class weights: {config.use_token_class_weights}")
+    print(f"⚖️  Relation class weights: {config.use_relation_class_weights}")
+    print(f"🔖 Use refined labels: {config.use_refined_labels}")
+    print(f"📊 Eval every {config.eval_steps} steps")
+    print("="*70)
+    trainer = train(config)
+    if trainer:
+        print(f"\n✅ Training complete! Test with:")
+        print(f"   python lilt_inference_relation_v6.py your_invoice.png --model {config.output_dir}")
 
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Train LiLT model for invoice extraction")
-    parser.add_argument("--train_dir", type=str, default=Config.train_dir, help="Training data directory")
-    parser.add_argument("--val_dir", type=str, default=Config.val_dir, help="Validation data directory")
-    parser.add_argument("--output_dir", type=str, default=Config.output_dir, help="Output directory")
-    parser.add_argument("--model_name", type=str, default=Config.model_name, help="Model name")
-    parser.add_argument("--max_seq_length", type=int, default=128, help="Max sequence length")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=1, help="Per-device batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    args = parser.parse_args()
-    
-    Config.train_dir = args.train_dir
-    Config.val_dir = args.val_dir
-    Config.output_dir = args.output_dir
-    Config.model_name = args.model_name
-    Config.max_seq_length = args.max_seq_length
-    Config.num_train_epochs = args.epochs
-    Config.learning_rate = args.learning_rate
-    Config.per_device_train_batch_size = args.batch_size
-    Config.gradient_accumulation_steps = args.gradient_accumulation_steps
-    Config.debug_mode = args.debug
-    
-    for d in [Config.train_dir, Config.val_dir]:
-        if not Path(d).exists():
-            logger.error(f"❌ Directory not found: {d}")
-            sys.exit(1)
-    
-    if torch.cuda.is_available():
-        logger.info(f"✅ CUDA available: {torch.cuda.get_device_name(0)}")
-        logger.info(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-    else:
-        logger.warning("⚠️ CUDA not available - training will be slow on CPU")
-    
-    train_lilt()
+    main()

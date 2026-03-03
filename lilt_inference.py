@@ -1,2194 +1,1210 @@
 #!/usr/bin/env python3
 """
-lilt_invoice_complete_fixed_v5.py — Fixed address and financial extraction
-FIXES:
-✅ Fixed vendor extraction: Filters out address labels
-✅ Fixed address mixing: Better boundary detection
-✅ Fixed shipping amount: Stricter label verification
-✅ Added Notes field extraction
-✅ Enhanced Order ID detection
+lilt_inference_relation22.py – Extract HEADER/QUESTION/ANSWER from invoice (PDF/image)
++ Generates visualisation PNG.
++ Extracts relations between QUESTION and ANSWER tokens.
++ Outputs structured invoice JSON.
+
+FIXES (r19):
+- group_answer_tokens: numeric tokens NOT grouped with text tokens on same line
+  (fixes "3 Strawberry" merging — "3" stays separate from "Strawberry").
+- build_invoice_json Pass 4: description column uses a RANGE (left_x to right_x)
+  instead of center±tol, so "Apple"/"Strawberry" are correctly captured even
+  when they sit left of the DESCRIPTION header center.
+- vendor_company: takes first QUESTION token at top-left of page (ABC Company Limited).
+- invoice_date / due_date: Pass 1 now only uses tokens to the RIGHT of the
+  question label (ax > qx), preventing left-side address tokens bleeding in.
+- bill_to: stops collecting once it hits a line that contains a QUESTION token
+  anywhere on the page at the same Y (prevents address spilling into table).
+- order_id: correctly takes only PO# token (first a_tok to the right of PO.# label).
 """
 
 import json
-import sys
-from pathlib import Path
 import re
-from datetime import datetime
-from PIL import Image, ImageDraw
-import torch
-import easyocr
+import sys
+import datetime
+from datetime import timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import gc
+from dataclasses import dataclass, field
+from collections import defaultdict
 
-import PIL.Image as PIL_Image
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+from transformers import LayoutLMv3Processor, AutoConfig, AutoModelForTokenClassification
+import easyocr
+import logging
 
-from transformers import AutoTokenizer, AutoModelForTokenClassification
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    print("pdf2image not installed. Please install it: pip install pdf2image")
+    sys.exit(1)
 
-class LiLTInvoiceParser:
-    def __init__(self, model_path: str, use_cuda: bool = True):
-        self.model_path = Path(model_path).resolve()
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"Model not found: {model_path}")
-        
-        # ✅ Load label map FIRST
-        self.id2label = self._load_label_map()
-        print(f"📋 Model labels: {set(self.id2label.values())}")
-        
-        # ✅ FIX: Use LayoutLMv3Processor OR DonutProcessor, not AutoProcessor
-        # Most LiLT models use LayoutLMv3Processor
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+@dataclass
+class InferenceConfig:
+    model_dir: str = "lilt_model_11"
+    token_labels: List[str] = field(default_factory=lambda: [
+        "O", "B-HEADER", "I-HEADER", "B-QUESTION", "I-QUESTION", "B-ANSWER", "I-ANSWER"
+    ])
+    max_length: int = 512
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    refine_labels: bool = True
+    confidence_threshold: float = 0.0
+    relation_confidence: float = 0.15
+    max_pair_dist: int = 50
+    spatial_dist: int = 600
+
+
+# --------------------------------------------------------------------------
+# OCR Helpers
+# --------------------------------------------------------------------------
+def _is_numeric_token(text: str) -> bool:
+    clean = re.sub(r"[^\d.,]", "", text)
+    return bool(re.match(r"^\d+\.?\d*$", clean)) and len(clean) >= 1
+
+
+def _contains_currency(text: str) -> bool:
+    return bool(re.search(r"[\$€£¥₹]|USD|EUR|GBP|HKD|HK\$", text))
+
+
+def load_image(path: str) -> Optional[Image.Image]:
+    path_lower = str(path).lower()
+    if path_lower.endswith('.pdf'):
         try:
-            from transformers import LayoutLMv3Processor
-            self.processor = LayoutLMv3Processor.from_pretrained(
-                model_path,
-                apply_ocr=False,  # CRITICAL: We provide our own OCR
-                use_fast=True,
-            )
-            print(f"✅ Using LayoutLMv3Processor")
+            pages = convert_from_path(path, first_page=1, last_page=1)
+            if pages:
+                return pages[0].convert("RGB")
+            logger.error("PDF conversion returned no pages.")
+            return None
         except Exception as e:
-            print(f"⚠️ LayoutLMv3Processor failed: {e}, trying LayoutLMv2Processor")
-            try:
-                from transformers import LayoutLMv2Processor
-                self.processor = LayoutLMv2Processor.from_pretrained(
-                    model_path,
-                    apply_ocr=False,
-                    revision="no_ocr",
-                )
-                print(f"✅ Using LayoutLMv2Processor")
-            except Exception as e2:
-                print(f"⚠️ LayoutLMv2Processor failed: {e2}, falling back to tokenizer")
-                self.processor = AutoTokenizer.from_pretrained(
-                    model_path,
-                    add_prefix_space=True,
-                )
-        
-        # ✅ Load model
-        self.model = AutoModelForTokenClassification.from_pretrained(
-            model_path,
-            ignore_mismatched_sizes=True,
-            torch_dtype=torch.float16 if use_cuda and torch.cuda.is_available() else torch.float32,
+            logger.error(f"PDF conversion failed: {e}")
+            return None
+    else:
+        try:
+            return Image.open(path).convert("RGB")
+        except Exception as e:
+            logger.error(f"Failed to open image: {e}")
+            return None
+
+
+def extract_ocr_tokens(image_path: str) -> Tuple[List[Dict], Tuple[int, int]]:
+    image = load_image(image_path)
+    if image is None:
+        return [], (0, 0)
+    w, h = image.size
+    tokens = []
+
+    try:
+        reader = easyocr.Reader(["en"], gpu=False)
+        scale  = 2
+        scaled = image.resize((w * scale, h * scale), Image.Resampling.LANCZOS)
+        results = reader.readtext(
+            np.array(scaled), detail=1, paragraph=False,
+            min_size=2, text_threshold=0.3, link_threshold=0.15,
+            canvas_size=2560, low_text=0.15,
         )
-        
-        # ✅ Device setup
-        self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        self.model.eval()
-        
-        # ✅ OCR setup
-        try:
-            if use_cuda and torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory > 4 * 1024**3:
-                self.reader = easyocr.Reader(['en'], gpu=True)
-            else:
-                self.reader = easyocr.Reader(['en'], gpu=False)
-                print("📝 EasyOCR running on CPU to save GPU memory")
-        except Exception as e:
-            print(f"⚠️ EasyOCR init failed: {e}")
-            self.reader = None
-        
-        print(f"✅ Model loaded | Device: {self.device} | Processor: {self.processor.__class__.__name__}")
-
-    def _get_model_size_mb(self):
-        """Calculate model size in MB"""
-        param_size = 0
-        for param in self.model.parameters():
-            param_size += param.nelement() * param.element_size()
-        buffer_size = 0
-        for buffer in self.model.buffers():
-            buffer_size += buffer.nelement() * buffer.element_size()
-        return (param_size + buffer_size) / 1024**2
-    
-    def _load_label_map(self) -> dict:
-        label_map_path = self.model_path / "label_map.json"
-        if label_map_path.exists():
-            with open(label_map_path) as f:
-                return {int(k): v for k, v in json.load(f).items()}
-        
-        from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(self.model_path)
-        if hasattr(config, 'id2label') and config.id2label:
-            return config.id2label
-        
-        return {
-            0: "O",
-            1: "B-HEADER", 2: "I-HEADER",
-            3: "B-QUESTION", 4: "I-QUESTION",
-            5: "B-ANSWER", 6: "I-ANSWER",
-            7: "B-OTHER", 8: "I-OTHER"
-        }
-    
-    def extract_ocr_tokens(self, image_path: str) -> Tuple[List[Dict], Tuple[int, int]]:
-        """Extract tokens with numeric/currency detection"""
-        image = Image.open(image_path).convert("RGB")
-        w, h = image.size
-        tokens = []
-        
-        if self.reader:
-            try:
-                results = self.reader.readtext(
-                    str(image_path),
-                    detail=1,
-                    paragraph=False,
-                    min_size=8
-                )
-                
-                for bbox, text, conf in results:
-                    if not text.strip() or conf < 0.25:
-                        continue
-                    
-                    x0 = int(min(p[0] for p in bbox))
-                    y0 = int(min(p[1] for p in bbox))
-                    x1 = int(max(p[0] for p in bbox))
-                    y1 = int(max(p[1] for p in bbox))
-                    
-                    if (x1 - x0) < 3 or (y1 - y0) < 3:
-                        continue
-                    
-                    norm_bbox = [
-                        max(0, min(1000, int(1000 * x0 / w))),
-                        max(0, min(1000, int(1000 * y0 / h))),
-                        max(0, min(1000, int(1000 * x1 / w))),
-                        max(0, min(1000, int(1000 * y1 / h))),
-                    ]
-                    
-                    tokens.append({
-                        "text": text.strip(),
-                        "bbox": [x0, y0, x1, y1],
-                        "norm_bbox": norm_bbox,
-                        "center_x": (x0 + x1) / 2,
-                        "center_y": (y0 + y1) / 2,
-                        "confidence": conf,
-                        "width": x1 - x0,
-                        "height": y1 - y0,
-                        "is_numeric": self._is_numeric_token(text),
-                        "is_currency": self._contains_currency(text),
-                    })
-                
-                tokens.sort(key=lambda t: (t["center_y"], t["center_x"]))
-                return tokens, (w, h)
-                
-            except Exception as e:
-                print(f"⚠️ EasyOCR failed: {e}")
-        
-        # Fallback to pytesseract
-        try:
-            import pytesseract
-            from pytesseract import Output
-            
-            ocr_data = pytesseract.image_to_data(image, output_type=Output.DICT, config='--psm 6')
-            
-            for i in range(len(ocr_data['text'])):
-                text = ocr_data['text'][i].strip()
-                if not text or int(ocr_data['conf'][i]) < 50:
-                    continue
-                
-                x, y = ocr_data['left'][i], ocr_data['top'][i]
-                w_t, h_t = ocr_data['width'][i], ocr_data['height'][i]
-                
-                if w_t < 3 or h_t < 3:
-                    continue
-                
-                tokens.append({
-                    "text": text,
-                    "bbox": [x, y, x + w_t, y + h_t],
-                    "norm_bbox": [
-                        max(0, min(1000, int(1000 * x / w))),
-                        max(0, min(1000, int(1000 * y / h))),
-                        max(0, min(1000, int(1000 * (x + w_t) / w))),
-                        max(0, min(1000, int(1000 * (y + h_t) / h))),
-                    ],
-                    "center_x": x + w_t / 2,
-                    "center_y": y + h_t / 2,
-                    "confidence": int(ocr_data['conf'][i]) / 100,
-                    "width": w_t,
-                    "height": h_t,
-                    "is_numeric": self._is_numeric_token(text),
-                    "is_currency": self._contains_currency(text),
-                })
-            
-            tokens.sort(key=lambda t: (t["center_y"], t["center_x"]))
-            return tokens, (w, h)
-            
-        except Exception as e:
-            print(f"⚠️ PyTesseract failed: {e}")
-            return [], (w, h)
-    
-    def _is_numeric_token(self, text: str) -> bool:
-        clean = re.sub(r'[^\d.,]', '', text)
-        return bool(re.match(r'^\d+\.?\d*$', clean)) and len(clean) >= 1
-    
-    def _contains_currency(self, text: str) -> bool:
-        return bool(re.search(r'[\$\€\£\¥\₹]|USD|EUR|GBP|JPY|INR', text))
-    
-    def _merge_adjacent_currency_tokens(self, tokens: List[Dict], img_w: int, img_h: int) -> List[Dict]:
-        """Merge split currency tokens ($ + 1,234.56)"""
-        merged = []
-        i = 0
-        horiz_tol = img_w * 0.04
-        vert_tol = img_h * 0.06
-        
-        while i < len(tokens):
-            curr = tokens[i]
-            if curr["is_currency"] and i + 1 < len(tokens):
-                nxt = tokens[i + 1]
-                if (abs(nxt["center_y"] - curr["center_y"]) < vert_tol and
-                    0 < (nxt["center_x"] - curr["center_x"]) < horiz_tol and
-                    nxt["is_numeric"]):
-                    
-                    merged_text = curr["text"] + nxt["text"]
-                    merged.append({
-                        **curr,
-                        "text": merged_text,
-                        "bbox": [
-                            curr["bbox"][0],
-                            min(curr["bbox"][1], nxt["bbox"][1]),
-                            nxt["bbox"][2],
-                            max(curr["bbox"][3], nxt["bbox"][3]),
-                        ],
-                        "center_x": (curr["center_x"] + nxt["center_x"]) / 2,
-                        "center_y": (curr["center_y"] + nxt["center_y"]) / 2,
-                        "width": nxt["bbox"][2] - curr["bbox"][0],
-                        "is_numeric": True,
-                        "is_currency": True,
-                    })
-                    i += 2
-                    continue
-            
-            merged.append(curr)
-            i += 1
-        
-        return merged
-
-    def predict(self, image_path: str) -> dict:
-        print(f"\n📄 Processing: {Path(image_path).name}")
-        
-        # 1. Extract OCR tokens
-        raw_tokens, (img_w, img_h) = self.extract_ocr_tokens(image_path)
-        if not raw_tokens:
-            print("⚠️ No text detected")
-            return self._empty_result(image_path, img_w, img_h)
-        
-        tokens = self._merge_adjacent_currency_tokens(raw_tokens, img_w, img_h)
-        print(f"   Size: {img_w}x{img_h} | Tokens: {len(tokens)} (merged from {len(raw_tokens)})")
-        
-        # ✅ DEBUG: Show first few tokens
-        print(f"   Sample tokens (first 10):")
-        for i, token in enumerate(tokens[:10]):
-            print(f"     {i}: '{token['text']}' @ ({token['center_x']:.0f}, {token['center_y']:.0f})")
-        
-        # 2. Prepare inputs CORRECTLY for the model
-        words = [t["text"] for t in tokens]
-        boxes = [t["norm_bbox"] for t in tokens]
-        
-        # ✅ Use PIL_Image (explicit global reference)
-        image = PIL_Image.open(image_path).convert("RGB")
-        
-        # ✅ CRITICAL: Check what type of processor we have
-        if hasattr(self.processor, 'image_processor'):
-            # It's a LayoutLM/LiLT processor
-            print(f"   Using multimodal processor with image...")
-            
-            # Try different encoding methods
-            try:
-                # Method 1: Standard LayoutLMv3 approach
-                encoding = self.processor(
-                    image, 
-                    words, 
-                    boxes=boxes,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=512,
-                    return_tensors="pt",
-                )
-            except Exception as e:
-                print(f"   Method 1 failed: {e}, trying Method 2...")
-                # Method 2: Try without image first
-                try:
-                    encoding = self.processor(
-                        text=words,
-                        boxes=boxes,
-                        padding="max_length",
-                        truncation=True,
-                        max_length=512,
-                        return_tensors="pt",
-                    )
-                    # Manually add pixel_values if needed
-                    if not hasattr(encoding, 'pixel_values'):
-                        import torchvision.transforms as transforms
-                        transform = transforms.Compose([
-                            transforms.Resize((224, 224)),
-                            transforms.ToTensor(),
-                        ])
-                        pixel_values = transform(image).unsqueeze(0)
-                        encoding['pixel_values'] = pixel_values
-                except Exception as e2:
-                    print(f"   Method 2 failed: {e2}, trying Method 3...")
-                    # Method 3: Fallback - use tokenizer only
-                    encoding = self.processor(
-                        text=words,
-                        padding="max_length",
-                        truncation=True,
-                        max_length=512,
-                        return_tensors="pt",
-                    )
-        else:
-            # It's just a tokenizer
-            print(f"   Using tokenizer-only approach...")
-            encoding = self.processor(
-                text=words,
-                padding="max_length",
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-        
-        # Move to device
-        encoding = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in encoding.items()}
-        
-        print(f"   Encoding keys: {encoding.keys()}")
-        print(f"   Input IDs shape: {encoding['input_ids'].shape if 'input_ids' in encoding else 'N/A'}")
-        
-        # 3. Run inference
-        with torch.no_grad():
-            try:
-                outputs = self.model(**encoding)
-                
-                # Get predictions
-                preds = outputs.logits.argmax(-1)
-                
-                # Handle batch dimension
-                if len(preds.shape) == 3:  # [batch, seq_len, num_labels]?
-                    preds = preds.squeeze(0)  # Remove batch
-                elif len(preds.shape) == 2:  # [batch, seq_len]
-                    preds = preds.squeeze(0) if preds.shape[0] == 1 else preds[0]
-                
-                # Convert to numpy
-                preds = preds.cpu().numpy()
-                
-                # Get probabilities for confidence
-                probs = torch.softmax(outputs.logits, dim=-1)
-                if len(probs.shape) == 3:
-                    probs = probs.squeeze(0)
-                probs = probs.cpu().numpy()
-                
-                # ✅ DEBUG: Print shapes
-                print(f"   Predictions shape: {preds.shape}")
-                print(f"   Probabilities shape: {probs.shape}")
-                if len(probs.shape) == 2:
-                    print(f"   Num labels: {probs.shape[1]}")
-                
-            except Exception as e:
-                print(f"❌ Model inference failed: {e}")
-                import traceback
-                traceback.print_exc()
-                return self._empty_result(image_path, img_w, img_h)
-        
-        # 4. Map predictions to tokens
-        predictions = []
-        
-        # Get word IDs for token alignment
-        if 'word_ids' in encoding:
-            word_ids = encoding.word_ids(batch_index=0)
-        else:
-            # Create simple alignment (1:1)
-            word_ids = list(range(len(tokens)))
-            if len(word_ids) > 512:  # Truncate if too long
-                word_ids = word_ids[:512]
-        
-        print(f"   Word IDs length: {len(word_ids)}, Predictions length: {len(preds)}")
-        
-        # Align predictions with tokens
-        seen = set()
-        for idx, word_idx in enumerate(word_ids):
-            if word_idx is None or word_idx in seen or word_idx >= len(tokens):
+        for bbox, text, conf in results:
+            text = text.strip()
+            if not text or conf < 0.05:
                 continue
-            
-            seen.add(word_idx)
-            
-            # Get label
-            if idx < len(preds):
-                label_id = int(preds[idx])
-                label = self.id2label.get(label_id, "O")
-                
-                # ✅ FIX: Safely extract confidence value
-                confidence = 0.0
-                if idx < len(probs):
-                    try:
-                        # Use proper 2D indexing
-                        confidence_value = probs[idx, label_id]
-                        
-                        # Handle different types
-                        if isinstance(confidence_value, np.ndarray):
-                            if confidence_value.ndim == 0:
-                                # 0-d array (scalar)
-                                confidence = float(confidence_value)
-                            else:
-                                # Multi-dimensional array
-                                confidence = float(confidence_value.ravel()[0])
-                        elif hasattr(confidence_value, 'item'):
-                            # NumPy scalar
-                            confidence = float(confidence_value.item())
-                        else:
-                            # Plain Python scalar
-                            confidence = float(confidence_value)
-                    except Exception as e:
-                        print(f"   Warning: Could not extract confidence at idx {idx}: {e}")
-                        confidence = 0.5  # Default confidence
-                
-                predictions.append({
-                    **tokens[word_idx],
-                    "label": label,
-                    "confidence": confidence,
-                })
-        
-        # 5. Diagnostics
-        entity_preds = [p for p in predictions if p["label"] != "O"]
-        print(f"📊 Entities detected: {len(entity_preds)}")
-        
-        if entity_preds:
-            print(f"   Entity breakdown:")
-            for label_type in set([p["label"] for p in entity_preds]):
-                count = sum(1 for p in entity_preds if p["label"] == label_type)
-                print(f"     {label_type}: {count}")
-            # Show first few entities
-            for i, pred in enumerate(entity_preds[:5]):
-                print(f"     {i}: '{pred['text']}' -> {pred['label']} ({pred['confidence']:.2f})")
-        
-        self._diagnose_invoice(predictions, img_w, img_h)
-        
-        # 6. Extract structured data
-        structured_data = self._extract_invoice_complete(predictions, img_w, img_h)
-        vis_image = self._visualize_predictions(Image.open(image_path).convert("RGB"), predictions)
-        
+            x0 = int(min(p[0] for p in bbox) / scale)
+            y0 = int(min(p[1] for p in bbox) / scale)
+            x1 = int(max(p[0] for p in bbox) / scale)
+            y1 = int(max(p[1] for p in bbox) / scale)
+            is_single_digit = len(text) == 1 and text.isdigit()
+            min_size = 1 if is_single_digit else 2
+            if (x1 - x0) < min_size or (y1 - y0) < min_size:
+                continue
+            if text == "QTV":  text = "QTY"
+            if text == "tOTal": text = "TOTAL"
+            tokens.append({
+                "text":      text,
+                "bbox":      [x0, y0, x1, y1],
+                "norm_bbox": [
+                    max(0, min(1000, int(1000 * x0 / w))),
+                    max(0, min(1000, int(1000 * y0 / h))),
+                    max(0, min(1000, int(1000 * x1 / w))),
+                    max(0, min(1000, int(1000 * y1 / h))),
+                ],
+                "center_x":  (x0 + x1) / 2,
+                "center_y":  (y0 + y1) / 2,
+                "confidence": conf,
+                "is_numeric": _is_numeric_token(text),
+                "is_currency": _contains_currency(text),
+            })
+        if tokens:
+            tokens.sort(key=lambda t: (t["center_y"], t["center_x"]))
+            logger.info(f"✅ EasyOCR: {len(tokens)} tokens")
+            return tokens, (w, h)
+    except Exception as e:
+        logger.warning(f"EasyOCR failed: {e}")
+
+    try:
+        import pytesseract
+        from pytesseract import Output
+        data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--psm 6 --oem 1")
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            conf = int(data["conf"][i])
+            is_single_digit = len(text) == 1 and text.isdigit()
+            min_conf = 30 if is_single_digit else 50
+            if not text or conf < min_conf:
+                continue
+            x, y, wt, ht = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            min_dim = 1 if is_single_digit else 3
+            if wt < min_dim or ht < min_dim:
+                continue
+            tokens.append({
+                "text":      text,
+                "bbox":      [x, y, x + wt, y + ht],
+                "norm_bbox": [
+                    max(0, min(1000, int(1000 * x / w))),
+                    max(0, min(1000, int(1000 * y / h))),
+                    max(0, min(1000, int(1000 * (x + wt) / w))),
+                    max(0, min(1000, int(1000 * (y + ht) / h))),
+                ],
+                "center_x":  x + wt / 2,
+                "center_y":  y + ht / 2,
+                "confidence": conf / 100,
+                "is_numeric": _is_numeric_token(text),
+                "is_currency": _contains_currency(text),
+            })
+        if tokens:
+            tokens.sort(key=lambda t: (t["center_y"], t["center_x"]))
+            logger.info(f"✅ Tesseract: {len(tokens)} tokens")
+            return tokens, (w, h)
+    except Exception as e:
+        logger.error(f"All OCR engines failed: {e}")
+
+    return [], (w, h)
+
+
+# --------------------------------------------------------------------------
+# Label refinement
+# --------------------------------------------------------------------------
+def refine_labels(predictions: List[Dict], img_w: int, img_h: int) -> List[Dict]:
+    def base(lbl: str) -> str:
+        return lbl[2:] if isinstance(lbl, str) and lbl.startswith(('B-', 'I-')) else lbl
+
+    line_tol = img_h * 0.02
+    wide_tol = img_h * 0.05
+
+    for t in predictions:
+        if t.get('center_x') is None:
+            b = t.get('bbox', [0, 0, 0, 0])
+            t['center_x'] = (b[0] + b[2]) / 2
+            t['center_y'] = (b[1] + b[3]) / 2
+        if 'is_numeric' not in t:
+            t['is_numeric'] = _is_numeric_token(t.get('text', ''))
+
+    col_hdr_kws = {"qty", "quantity", "description", "unit price", "amount", "rate", "price",
+                   "item", "product", "code", "part", "sku"}
+
+    header_candidates = []
+    for p in predictions:
+        tl = p['text'].lower().strip()
+        if any(k in tl for k in col_hdr_kws):
+            if img_h * 0.1 < p['center_y'] < img_h * 0.7:
+                header_candidates.append(p['center_y'])
+
+    header_row_y = float(np.median(header_candidates)) if header_candidates else None
+    table_top    = (header_row_y + img_h * 0.02) if header_row_y else img_h * 0.35
+    table_bottom = img_h * 0.75
+
+    for p in predictions:
+        tl = p['text'].lower().strip()
+        if tl in ('total', 'subtotal') and p['center_y'] > img_h * 0.4:
+            table_bottom = min(table_bottom, p['center_y'] + img_h * 0.01)
+            break
+
+    logger.info(f"📊 Column header row y={header_row_y}  table: y={table_top:.0f}–{table_bottom:.0f}")
+
+    data_rows_y = set()
+    for p in predictions:
+        if base(p['label']) == 'ANSWER' and not p['is_numeric']:
+            data_rows_y.add(p['center_y'])
+
+    for t in predictions:
+        if not t['is_numeric'] or base(t['label']) == 'ANSWER':
+            continue
+        cy = t['center_y']
+        if not (table_top < cy < table_bottom):
+            continue
+        if any(abs(cy - dr) < line_tol for dr in data_rows_y):
+            t['label'] = 'ANSWER'
+
+    qty_tok = next((p for p in predictions
+                    if p['text'].lower().strip() in ('qty', 'quantity', 'qty.')), None)
+    if qty_tok:
+        qty_x    = qty_tok['center_x']
+        col_band = img_w * 0.09
+        for t in predictions:
+            if not t['is_numeric'] or base(t['label']) == 'ANSWER':
+                continue
+            if abs(t['center_x'] - qty_x) > col_band or t['center_y'] <= qty_tok['center_y']:
+                continue
+            if (table_top < t['center_y'] < table_bottom
+                    or any(abs(t['center_y'] - dr) < wide_tol for dr in data_rows_y)):
+                old = t['label']
+                t['label'] = 'ANSWER'
+                logger.info(f"  QTY-band → ANSWER: '{t['text']}' (was {old})")
+
+    desc_answers = [p for p in predictions
+                    if base(p['label']) == 'ANSWER' and not p['is_numeric']
+                    and table_top < p['center_y'] < table_bottom]
+    for desc in desc_answers:
+        for t in predictions:
+            if not t['is_numeric'] or base(t['label']) == 'ANSWER':
+                continue
+            if t['center_x'] >= desc['center_x'] or abs(t['center_y'] - desc['center_y']) > wide_tol:
+                continue
+            if header_row_y and t['center_y'] <= header_row_y:
+                continue
+            old = t['label']
+            t['label'] = 'ANSWER'
+            logger.info(f"  desc-neighbour → ANSWER: '{t['text']}' (was {old})")
+
+    if header_row_y:
+        for t in predictions:
+            if abs(t['center_y'] - header_row_y) < line_tol:
+                tl = t['text'].lower().strip()
+                if any(k in tl for k in col_hdr_kws) and base(t['label']) == 'ANSWER':
+                    t['label'] = 'QUESTION'
+                    logger.info(f"  col-header → QUESTION: '{t['text']}'")
+
+    field_label_kws = {"invoice #", "invoice date", "p.o.#", "due date", "bill to", "ship to",
+                       "po#", "p.o.", "order", "terms"}
+    for t in predictions:
+        tl = t['text'].lower().strip()
+        if any(k in tl for k in field_label_kws) and base(t['label']) == 'ANSWER':
+            t['label'] = 'QUESTION'
+            logger.info(f"  field-label → QUESTION: '{t['text']}'")
+
+    answer_value_pats = [r'^\d{4}/\d{2}/\d{2}$', r'^\d{4}-\d{2}-\d{2}$',
+                         r'^[A-Z]{2,4}-\d{4,}', r'^PO-']
+    for t in predictions:
+        if base(t['label']) not in ('QUESTION', 'O'):
+            continue
+        if any(re.match(pat, t['text'].strip()) for pat in answer_value_pats):
+            t['label'] = 'ANSWER'
+            logger.info(f"  value-pattern → ANSWER: '{t['text']}'")
+
+    terms_kws = {"terms & conditions", "terms and conditions"}
+    term_hdr = next((p for p in sorted(predictions, key=lambda x: x['center_y'])
+                     if any(k in p['text'].lower() for k in terms_kws)
+                     and p['center_y'] > img_h * 0.6), None)
+    if term_hdr:
+        for p in predictions:
+            if p is term_hdr:
+                continue
+            if term_hdr['center_y'] - line_tol < p['center_y'] < term_hdr['center_y'] + img_h * 0.25:
+                if base(p['label']) == 'QUESTION' and not p['is_numeric']:
+                    p['label'] = 'ANSWER'
+
+    pay_pats = [r'payment\s+is\s+due\s+within\s+\d+\s+days', r'net\s+\d+', r'due\s+(?:upon|on)\s+receipt']
+    line_groups: Dict[float, List] = {}
+    for p in predictions:
+        cy    = p['center_y']
+        found = False
+        for ly in line_groups:
+            if abs(cy - ly) < line_tol:
+                line_groups[ly].append(p)
+                found = True
+                break
+        if not found:
+            line_groups[cy] = [p]
+    for ly, toks in line_groups.items():
+        lt = ' '.join(t['text'] for t in sorted(toks, key=lambda x: x['center_x']))
+        if any(re.search(pat, lt, re.I) for pat in pay_pats) and ':' not in lt:
+            for t in toks:
+                if base(t['label']) == 'QUESTION':
+                    t['label'] = 'ANSWER'
+
+    decorative = {"thank you", "powered by", "thank", "regards", "sincerely"}
+    for t in predictions:
+        tl = t['text'].lower().strip()
+        if any(d in tl for d in decorative) and base(t['label']) == 'ANSWER':
+            t['label'] = 'O'
+            logger.info(f"  decorative → O: '{t['text']}'")
+
+    return predictions
+
+
+# --------------------------------------------------------------------------
+# Visualisation
+# --------------------------------------------------------------------------
+def visualize(image: Image.Image, predictions: List[Dict]) -> Image.Image:
+    draw    = ImageDraw.Draw(image)
+    cmap    = {'HEADER': 'red', 'QUESTION': 'blue', 'ANSWER': 'limegreen', 'O': 'gray'}
+    colored = 0
+    for p in predictions:
+        lbl   = p.get('label', 'O')
+        color = cmap.get(lbl, 'gray')
+        if color == 'gray':
+            continue
+        box = p.get('bbox', [0, 0, 0, 0])
+        if box[2] > box[0] and box[3] > box[1]:
+            draw.rectangle(box, outline=color, width=2)
+            draw.text((box[0], max(0, box[1] - 15)), lbl[:4].upper(),
+                      fill=color, stroke_width=1, stroke_fill='white')
+            colored += 1
+    logger.info(f"🎨 Colored {colored} tokens")
+    return image
+
+
+# --------------------------------------------------------------------------
+# Group answer tokens — numeric and text tokens kept SEPARATE
+# --------------------------------------------------------------------------
+def group_answer_tokens(tokens: List[Dict], img_w: int, img_h: int,
+                        line_tol_factor: float = 0.02,
+                        word_gap_factor: float = 0.07) -> List[Dict]:
+    """
+    Group adjacent ANSWER tokens on the same line.
+
+    KEY FIX (r19): numeric tokens and text tokens are NEVER merged into the
+    same group. This prevents "3" (QTY) from joining "Strawberry" (DESCRIPTION)
+    even when they happen to be close horizontally.
+
+    Also: group width capped at 40% of page to prevent cross-column merging.
+    """
+    line_tol  = img_h * line_tol_factor
+    word_gap  = img_w * word_gap_factor
+    max_width = img_w * 0.40
+
+    answer_tokens = [t for t in tokens if t['label'] == 'ANSWER']
+    if not answer_tokens:
+        return []
+
+    # Group by horizontal line
+    lines: Dict[float, List] = {}
+    for t in answer_tokens:
+        matched = False
+        for y in list(lines.keys()):
+            if abs(t['center_y'] - y) < line_tol:
+                lines[y].append(t)
+                matched = True
+                break
+        if not matched:
+            lines[t['center_y']] = [t]
+
+    grouped = []
+    for y, line in lines.items():
+        line.sort(key=lambda t: t['center_x'])
+        current = [line[0]]
+        for t in line[1:]:
+            prev         = current[-1]
+            gap          = t['bbox'][0] - prev['bbox'][2]
+            group_width  = t['bbox'][2] - current[0]['bbox'][0]
+            # FIX: never merge numeric with non-numeric (or vice versa)
+            type_mismatch = (t.get('is_numeric', False) != prev.get('is_numeric', False))
+            if gap < word_gap and group_width < max_width and not type_mismatch:
+                current.append(t)
+            else:
+                grouped.append(current)
+                current = [t]
+        grouped.append(current)
+
+    result = []
+    for group in grouped:
+        result.append({
+            'text':       ' '.join(t['text'] for t in group).strip(),
+            'bbox':       [min(t['bbox'][0] for t in group),
+                           min(t['bbox'][1] for t in group),
+                           max(t['bbox'][2] for t in group),
+                           max(t['bbox'][3] for t in group)],
+            'center_x':   float(np.mean([t['center_x'] for t in group])),
+            'center_y':   float(np.mean([t['center_y'] for t in group])),
+            'confidence': float(np.mean([t['confidence'] for t in group])),
+            'label':      'ANSWER',
+            'is_numeric': group[0].get('is_numeric', False),
+            'group':      [t['text'] for t in group],
+        })
+    return result
+
+
+# --------------------------------------------------------------------------
+# Relation Extraction
+# --------------------------------------------------------------------------
+def extract_relations(tokens: List[Dict], config: InferenceConfig,
+                      img_w: int, img_h: int) -> List[Dict]:
+    same_line_tol = img_h * 0.025
+    col_align_tol = img_w * 0.06
+
+    KNOWN_FIELD_LABELS = {
+        "invoice #", "invoice date", "due date", "p.o.#", "po.#", "po#",
+        "p.o. #", "bill to", "ship to", "payment terms", "terms & conditions",
+        "balance due", "total", "subtotal", "tax", "discount", "shipping",
+        "attention", "currency", "order #", "date", "ref #", "reference",
+    }
+    TABLE_COL_LABELS = {"qty", "quantity", "description", "item",
+                        "unit price", "price", "rate", "amount"}
+
+    def is_real_question(q: Dict) -> bool:
+        qt = q['text'].lower().strip().rstrip(':').strip()
+        if qt in KNOWN_FIELD_LABELS:
+            return True
+        if any(kw in qt for kw in TABLE_COL_LABELS):
+            return True
+        if len(qt.split()) > 2:
+            return False
+        cx_frac = q['center_x'] / img_w
+        if 0.15 < cx_frac < 0.85 and qt not in KNOWN_FIELD_LABELS:
+            if not re.search(r'[#:@]', qt):
+                ABBREV_LABELS = {"qty", "ref", "attn", "po", "vat", "gst",
+                                 "hsn", "sku", "upc", "item", "date", "no",
+                                 "terms", "amount", "price", "rate", "desc"}
+                if qt not in ABBREV_LABELS:
+                    return False
+        return True
+
+    def q_semantic_key(q_text: str) -> str:
+        qt = q_text.lower().strip().rstrip(':').strip()
+        if re.search(r"inv[o0]ice\s*[#n]", qt):             return "invoice_number"
+        if re.search(r"inv[o0]ice\s*date", qt):              return "invoice_date"
+        if re.search(r"due\s*date", qt):                      return "due_date"
+        if re.search(r"p\.?o\.?\s*#|purchase\s*order", qt):  return "po_number"
+        if re.search(r"order\s*#", qt):                       return "order_number"
+        if re.search(r"bill\s*to", qt):                       return "bill_to"
+        if re.search(r"ship\s*to", qt):                       return "ship_to"
+        if re.search(r"payment\s*term", qt):                  return "payment_terms"
+        if re.search(r"terms\s*&?\s*conditions?", qt):        return "terms"
+        if re.search(r"balance\s*due", qt):                   return "balance_due"
+        if re.search(r"\btotal\b", qt):                       return "total"
+        if re.search(r"subtotal", qt):                        return "subtotal"
+        if re.search(r"\btax\b", qt):                         return "tax"
+        if re.search(r"discount", qt):                        return "discount"
+        if re.search(r"shipping|freight", qt):                return "shipping"
+        if re.search(r"\bqty\b|\bquantity\b", qt):           return "qty_col"
+        if re.search(r"desc|item|product", qt):               return "desc_col"
+        if re.search(r"unit\s*price|rate", qt):               return "unit_price_col"
+        if re.search(r"\bamount\b", qt):                      return "amount_col"
+        return qt
+
+    questions     = [t for t in tokens if t['label'] == 'QUESTION' and is_real_question(t)]
+    answer_groups = group_answer_tokens(tokens, img_w, img_h)
+
+    if not questions or not answer_groups:
+        return []
+
+    # ── Build table column headers with X-range boundaries (same as build_invoice_json) ──
+    table_col_qs = [q for q in questions if any(kw in q['text'].lower() for kw in TABLE_COL_LABELS)]
+    header_row_y = float(np.median([q['center_y'] for q in table_col_qs])) if table_col_qs else None
+
+    # Build col_headers with left/right range so DESCRIPTION captures answers
+    # that sit LEFT of the column header center (e.g. "Apple" at x=320, header at x=562)
+    # Build column ranges keyed by column NAME (not object identity)
+    col_headers_rel: List[Dict] = []
+    if table_col_qs and header_row_y is not None:
+        qs_sorted = sorted(table_col_qs, key=lambda q: q['center_x'])
+        for i, q in enumerate(qs_sorted):
+            left_x  = (qs_sorted[i-1]['center_x'] + q['center_x']) / 2 if i > 0 else 0
+            right_x = (q['center_x'] + qs_sorted[i+1]['center_x']) / 2 if i < len(qs_sorted)-1 else img_w
+            col_headers_rel.append({
+                'name':     q['text'].lower().strip(),
+                'center_x': q['center_x'],
+                'left_x':   left_x,
+                'right_x':  right_x,
+            })
+        logger.info(f"  Relation col ranges: {[(c['name'], round(c['left_x']), round(c['right_x'])) for c in col_headers_rel]}")
+
+    def get_col_name_for_x(ax: float) -> Optional[str]:
+        for col in col_headers_rel:
+            if col['left_x'] <= ax <= col['right_x']:
+                return col['name']
+        return None
+
+    def q_col_name(q: Dict) -> Optional[str]:
+        for col in col_headers_rel:
+            if col['left_x'] <= q['center_x'] <= col['right_x']:
+                return col['name']
+        return None
+
+    logger.info(f"  Filtered questions: {[q['text'] for q in questions]}")
+    logger.info(f"  Table header row y={header_row_y}")
+    logger.info(f"  Answer groups: {[a['text'] for a in answer_groups]}")
+
+    best_for_q: Dict[str, Dict] = {}
+    max_dist = float(config.spatial_dist)
+
+    for q in questions:
+        qx, qy  = q['center_x'], q['center_y']
+        q_conf  = max(q.get('confidence', 0.5), 0.5)
+        q_key   = q_semantic_key(q['text'])
+        is_col  = header_row_y is not None and abs(qy - header_row_y) < same_line_tol * 2
+        this_col_name = q_col_name(q) if is_col else None
+
+        for a in answer_groups:
+            ax, ay = a['center_x'], a['center_y']
+
+            if is_col:
+                if ay <= header_row_y + same_line_tol:
+                    continue
+                # FIX: compare column names (strings), not object identity
+                answer_col_name = get_col_name_for_x(ax)
+                if answer_col_name is None or answer_col_name != this_col_name:
+                    continue
+                dy    = ay - header_row_y
+                # FIX: use average (not product) of confidences to avoid near-zero scores
+                score = ((q_conf + a.get('confidence', 0.5)) / 2.0) * (1.0 - min(dy, max_dist) / max_dist)
+                if score < config.relation_confidence:
+                    continue
+                row_bucket = round(ay / (img_h * 0.04))
+                key = f"{q_key}_row{row_bucket}"
+            else:
+                if ax < qx - img_w * 0.05:
+                    continue
+                if ay > qy + img_h * 0.08:
+                    continue
+                if ay < qy - same_line_tol:
+                    continue
+                dx            = abs(qx - ax)
+                dy            = abs(qy - ay)
+                weighted_dist = dx + dy * 3.0
+                if weighted_dist > max_dist:
+                    continue
+                same_line  = dy < same_line_tol
+                line_bonus = 0.3 if same_line else 0.0
+                proximity  = 1.0 - (weighted_dist / max_dist)
+                score      = ((q_conf + a.get('confidence', 0.5)) / 2.0) * proximity + line_bonus
+                if score < config.relation_confidence:
+                    continue
+                key = q_key
+
+            cand = {
+                'question':      q['text'],
+                'answer':        a['text'],
+                'confidence':    round(float(score), 4),
+                'same_line':     int(abs(ay - qy) < same_line_tol),
+                'question_bbox': q.get('bbox'),
+                'answer_bbox':   a.get('bbox'),
+            }
+            if key not in best_for_q or cand['confidence'] > best_for_q[key]['confidence']:
+                best_for_q[key] = cand
+
+    # BILL TO: full multi-line address — collect ANSWER tokens below BILL TO
+    bill_to_q = next((q for q in questions if re.search(r"bill\s*to", q['text'], re.I)), None)
+    if bill_to_q:
+        bqy    = bill_to_q['center_y']
+        # Stop before the table header row
+        max_ay = (header_row_y - img_h * 0.02) if header_row_y else bqy + img_h * 0.20
+        addr_lines = []
+        for a in sorted(answer_groups, key=lambda a: a['center_y']):
+            if a['center_y'] <= bqy + same_line_tol:
+                continue
+            if a['center_y'] > max_ay:
+                break
+            # Left half only, no pure numerics (table QTY/amounts leak in otherwise)
+            if a['center_x'] < img_w * 0.45 and not a.get('is_numeric', False):
+                addr_lines.append(('answer', a['center_y'], a['text']))
+        # Sort and deduplicate
+        addr_lines.sort(key=lambda x: x[1])
+        seen_texts = set()
+        deduped = []
+        for _, _, txt in addr_lines:
+            if txt not in seen_texts:
+                seen_texts.add(txt)
+                deduped.append(txt)
+        if deduped:
+            best_for_q['bill_to'] = {
+                'question':      'BILL TO',
+                'answer':        '\n'.join(deduped),
+                'confidence':    1.0,
+                'same_line':     0,
+                'question_bbox': bill_to_q.get('bbox'),
+                'answer_bbox':   [0, 0, 0, 0],
+            }
+            logger.info(f"  BILL TO → {deduped}")
+
+    # TOTAL: ANSWER-labeled TOTAL token → value to its right
+    total_tok = next((t for t in tokens
+                      if t['label'] == 'ANSWER'
+                      and t['text'].upper() in ('TOTAL', 'TOTAL:')), None)
+    if total_tok:
+        tx, ty     = total_tok['center_x'], total_tok['center_y']
+        candidates = [a for a in answer_groups
+                      if abs(a['center_y'] - ty) < same_line_tol
+                      and a['center_x'] > tx
+                      and a['text'].upper() not in ('TOTAL', 'TOTAL:')]
+        if candidates:
+            best_total = min(candidates, key=lambda a: a['center_x'])
+            best_for_q['total'] = {
+                'question':      'TOTAL',
+                'answer':        best_total['text'],
+                'confidence':    1.0,
+                'same_line':     1,
+                'question_bbox': total_tok.get('bbox'),
+                'answer_bbox':   best_total.get('bbox'),
+            }
+            logger.info(f"  TOTAL → '{best_total['text']}'")
+
+    relations = sorted(best_for_q.values(), key=lambda r: r['confidence'], reverse=True)
+    logger.info(f"🔗 {len(relations)} relations extracted")
+    return relations
+
+
+# --------------------------------------------------------------------------
+# Label extraction class
+# --------------------------------------------------------------------------
+class LabelExtractor:
+    def __init__(self, config: InferenceConfig):
+        self.config    = config
+        self.processor = None
+        self.model     = None
+        self.id2label  = {}
+        self._load_model()
+
+    def _load_model(self):
+        mp = Path(self.config.model_dir)
+        lm = mp / "label_map.json"
+        if lm.exists():
+            with open(lm) as f:
+                self.id2label = {int(k): v for k, v in json.load(f).items()}
+        else:
+            self.id2label = {i: l for i, l in enumerate(self.config.token_labels)}
+            logger.warning("label_map.json not found, using defaults")
+
+        self.processor = LayoutLMv3Processor.from_pretrained(
+            "microsoft/layoutlmv3-base", apply_ocr=False)
+
+        cfg = AutoConfig.from_pretrained(mp, ignore_mismatched_sizes=True)
+        cfg.num_labels = len(self.id2label)
+        self.model = AutoModelForTokenClassification.from_pretrained(
+            mp, config=cfg, ignore_mismatched_sizes=True)
+        self.model.to(self.config.device).eval()
+        logger.info(f"✅ Model loaded from {self.config.model_dir}")
+
+    def extract(self, image_path: str) -> Dict:
+        tokens, (img_w, img_h) = extract_ocr_tokens(image_path)
+        if not tokens:
+            logger.error("No tokens extracted")
+            return {"error": "No tokens"}
+
+        words     = [t["text"] for t in tokens]
+        boxes     = [t["norm_bbox"] for t in tokens]
+        dummy_img = Image.new("RGB", (224, 224), color="white")
+
+        encoding = self.processor(
+            images=dummy_img, text=words, boxes=boxes,
+            padding="max_length", truncation=True,
+            max_length=self.config.max_length, return_tensors="pt",
+        )
+        for k, v in encoding.items():
+            if isinstance(v, torch.Tensor):
+                encoding[k] = v.to(self.config.device)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=encoding["input_ids"],
+                bbox=encoding["bbox"],
+                attention_mask=encoding["attention_mask"],
+            )
+        probs    = torch.softmax(outputs.logits, dim=-1)[0]
+        pred_ids = torch.argmax(probs, dim=-1).cpu().numpy()
+        confs    = torch.max(probs, dim=-1).values.cpu().numpy().tolist()
+
+        word_ids = encoding.word_ids(0)
+        aligned  = []
+        seen     = set()
+        for idx, wid in enumerate(word_ids):
+            if wid is None or wid in seen or wid >= len(tokens):
+                continue
+            seen.add(wid)
+            tok        = tokens[wid].copy()
+            raw_label  = self.id2label.get(int(pred_ids[idx]), "O")
+            base_label = raw_label[2:] if raw_label.startswith(("B-", "I-")) else raw_label
+            confidence = confs[idx]
+            if self.config.confidence_threshold > 0 and confidence < self.config.confidence_threshold:
+                base_label = "O"
+            tok["model_label"] = raw_label
+            tok["label"]       = base_label
+            tok["confidence"]  = round(float(confidence), 4)
+            aligned.append(tok)
+
+        if self.config.refine_labels:
+            aligned = refine_labels(aligned, img_w, img_h)
+
+        counts = {"HEADER": 0, "QUESTION": 0, "ANSWER": 0, "O": 0}
+        for t in aligned:
+            counts[t["label"]] += 1
+
+        orig_image = load_image(image_path)
+        vis_image  = visualize(orig_image.copy(), aligned) if orig_image else None
+
         return {
-            "image_path": str(Path(image_path).resolve()),
-            "image_size": {"width": img_w, "height": img_h},
-            "raw_predictions": predictions,
-            "entity_count": len(entity_preds),
-            "structured_data": structured_data,
+            "image_path":    str(Path(image_path).resolve()),
+            "image_size":    {"width": img_w, "height": img_h},
+            "tokens":        aligned,
+            "stats":         counts,
             "visualization": vis_image,
         }
 
-    def _diagnose_invoice(self, predictions: List[Dict], img_w: int, img_h: int):
-        """Enhanced diagnostics with safe column detection"""
-        print(f"\n🔍 INVOICE STRUCTURE ANALYSIS")
-        print("="*70)
-        
-        numeric_tokens = [p for p in predictions if p.get("is_numeric")]
-        if numeric_tokens:
-            x_positions = sorted([p["center_x"] for p in numeric_tokens])
-            columns = []
-            if x_positions:
-                current_col = [x_positions[0]]
-                for x in x_positions[1:]:
-                    if x - current_col[-1] < img_w * 0.08:
-                        current_col.append(x)
-                    else:
-                        columns.append((min(current_col), max(current_col)))
-                        current_col = [x]
-                if current_col:
-                    columns.append((min(current_col), max(current_col)))
-            
-            print(f"📊 Detected numeric columns: {len(columns)}")
-            for i, (x_min, x_max) in enumerate(columns):
-                col_tokens = [p for p in numeric_tokens if x_min <= p["center_x"] <= x_max]
-                if col_tokens:
-                    avg_x = sum(p["center_x"] for p in col_tokens) / len(col_tokens)
-                    sample_text = col_tokens[0]["text"] if col_tokens else "N/A"
-                    print(f"   Column {i+1}: x={int(avg_x):4d}px | {len(col_tokens)} tokens | Sample: {sample_text}")
-            
-            if columns:
-                rightmost_col = columns[-1]
-                rightmost_tokens = [p for p in numeric_tokens if rightmost_col[0] <= p["center_x"] <= rightmost_col[1]]
-                if rightmost_tokens:
-                    print(f"\n➡️  RIGHT-MOST COLUMN (x={int(rightmost_col[0])}-{int(rightmost_col[1])}px):")
-                    for token in sorted(rightmost_tokens, key=lambda x: x["center_y"])[-5:]:
-                        amount = self._parse_currency(token["text"])
-                        if amount > 0:
-                            print(f"   ${amount:>10.2f} @ y={int(token['center_y']):4d}")
-        
-        # Check for address labels
-        address_labels = ["bill", "ship", "attention", "attn", "to:", "address"]
-        for pred in predictions:
-            text_lower = pred["text"].lower()
-            if any(label in text_lower for label in address_labels):
-                print(f"📍 Address label: '{pred['text']}' @ ({int(pred['center_x'])}, {int(pred['center_y'])})")
-        
-        print("="*70)
-    
-    def _extract_invoice_complete(self, predictions: List[Dict], img_w: int, img_h: int) -> Dict:
-        """COMPLETE EXTRACTION PIPELINE - FIXED VERSION"""
-        result = self._empty_result("", img_w, img_h)["structured_data"]
-        
-        # Vendor (top-left) - FIXED: Filter out address labels
-        result["vendor_company"] = self._extract_vendor_company(predictions, img_w, img_h)
-        
-        # Invoice number
-        result["invoice_number"] = self._extract_invoice_number(predictions, img_w, img_h)
-        
-        # Dates
-        dates = self._extract_dates(predictions)
-        if dates:
-            result["invoice_date"] = dates[0]
-            if len(dates) > 1:
-                result["due_date"] = dates[1]
-        
-        # Order ID (expanded)
-        result["order_id"] = self._extract_order_id_comprehensive(predictions, img_w, img_h)
-        
-        # Addresses - FIXED: Better boundary detection
-        addresses = self._extract_addresses_with_boundaries(predictions, img_w, img_h)
-        result["bill_to"] = addresses.get("bill_to", "")
-        result["ship_to"] = addresses.get("ship_to", "")
 
-        # Line items (table detection)
-        result["items"] = self._extract_line_items_table(predictions, img_w, img_h)
-        
-        # Financials - FIXED: Stricter label verification
-        financials = self._extract_financial_strict(predictions, img_w, img_h)
-        result.update(financials)
-        
-        # Payment terms
-        result["payment_terms"] = self._extract_payment_terms_improved(predictions, img_w, img_h)
-        
-        # Notes - NEW FIELD
-        result["notes"] = self._extract_notes(predictions, img_h)
-        
-        # Currency
-        result["currency"] = self._detect_currency(predictions)
-        
-        # Confidence
-        entity_confs = [p["confidence"] for p in predictions if p["label"] != "O"]
-        if entity_confs:
-            result["extraction_confidence"] = sum(entity_confs) / len(entity_confs)
-        
-        return result
-    
-    def _extract_vendor_company(self, predictions: List[Dict], img_w: int, img_h: int) -> str:
-        """Extract vendor company using BETTER LOGIC, not character correction"""
-        # 1. First look for HEADER labeled tokens (most reliable)
-        header_tokens = [
-            p for p in predictions 
-            if p["label"] in ["B-HEADER", "I-HEADER"] 
-            and p["center_y"] < img_h * 0.3  # Top area
-        ]
-        
-        if header_tokens:
-            # Group by line (similar Y position)
-            lines = {}
-            line_tol = img_h * 0.02
-            
-            for token in header_tokens:
-                y = token["center_y"]
-                found = False
-                for line_y in lines:
-                    if abs(y - line_y) < line_tol:
-                        lines[line_y].append(token)
-                        found = True
-                        break
-                if not found:
-                    lines[y] = [token]
-            
-            # Process the highest header line (topmost)
-            if lines:
-                top_line_y = min(lines.keys())
-                top_tokens = sorted(lines[top_line_y], key=lambda x: x["center_x"])
-                
-                # Check if this looks like a vendor name (not invoice label, etc.)
-                line_text = " ".join(t["text"] for t in top_tokens)
-                if self._is_likely_vendor_name(line_text):
-                    print(f"🔍 Header vendor: '{line_text}'")
-                    return line_text
-        
-        # 2. Look for the largest text in top-left quadrant (fallback)
-        top_left = [
-            p for p in predictions 
-            if p["center_y"] < img_h * 0.2 and p["center_x"] < img_w * 0.4
-            and not self._is_address_label(p["text"])
-            and not self._looks_like_date(p["text"])
-            and not p.get("is_numeric")
-        ]
-        
-        if not top_left:
-            return ""
-        
-        # Sort by size (area = width * height) - vendors are often largest
-        top_left.sort(key=lambda x: -(x["width"] * x["height"]))
-        
-        for token in top_left[:3]:  # Check top 3 largest
-            text = token["text"].strip()
-            
-            # Skip obvious non-vendors
-            if (len(text) < 3 or 
-                text.lower() in ["invoice", "date", "order", "page", "no"] or
-                any(c.isdigit() for c in text)):
-                continue
-            
-            # Check if text contains likely vendor patterns
-            if self._is_likely_vendor_name(text):
-                print(f"🔍 Largest text vendor: '{text}'")
-                return text
-            
-            # If text is split across tokens, try to find adjacent tokens
-            # Look for tokens on same line within reasonable distance
-            same_line_tokens = [
-                p for p in predictions
-                if abs(p["center_y"] - token["center_y"]) < img_h * 0.02
-                and p["center_x"] > token["center_x"]
-                and p["center_x"] - token["center_x"] < img_w * 0.2
-            ]
-            
-            if same_line_tokens:
-                same_line_tokens.sort(key=lambda x: x["center_x"])
-                combined = text + " " + " ".join(t["text"] for t in same_line_tokens)
-                if self._is_likely_vendor_name(combined):
-                    print(f"🔍 Combined vendor: '{combined}'")
-                    return combined
-        
-        return ""
+# --------------------------------------------------------------------------
+# Structured Invoice Builder
+# --------------------------------------------------------------------------
+def build_invoice_json(result: Dict, image_path: str) -> Dict:
+    tokens   = result["tokens"]
+    img_w    = result["image_size"]["width"]
+    img_h    = result["image_size"]["height"]
+    line_tol = img_h * 0.02
 
-
-    def _is_likely_vendor_name(self, text: str) -> bool:
-        """Determine if text looks like a vendor name"""
-        if not text or len(text) < 3:
-            return False
-        
-        text_lower = text.lower()
-        
-        # Definitely NOT vendor names
-        not_vendor_patterns = [
-            r'^invoice\s*(?:no|#|number|date)?',
-            r'^order\s*(?:no|#|id)?',
-            r'^bill\s+to',
-            r'^ship\s+to',
-            r'^address',
-            r'^phone',
-            r'^email',
-            r'^page\s*\d+',
-            r'^\d+[/-]\d+[/-]\d+',  # Dates
-            r'^[\d\s\$\€\£\¥\₹]+$',  # Just numbers/currency
-        ]
-        
-        for pattern in not_vendor_patterns:
-            if re.match(pattern, text_lower):
-                return False
-        
-        # Vendor names SHOULD have these characteristics:
-        # 1. Not all numbers
-        if re.fullmatch(r'[\d\s]+', text):
-            return False
-        
-        # 2. Not just currency amounts
-        if re.match(r'^[\$\€\£\¥\₹]?\s*\d+\.?\d*$', text):
-            return False
-        
-        # 3. Not too many numbers (maybe 30% max)
-        digit_count = sum(1 for c in text if c.isdigit())
-        if digit_count > len(text) * 0.3:
-            return False
-        
-        # 4. Usually has letters
-        if not re.search(r'[A-Za-z]', text):
-            return False
-        
-        # 5. Usually not all uppercase (might be a header label)
-        # But some vendors ARE all caps, so this is weak
-        
-        return True
-    
-    def _looks_like_date(self, text: str) -> bool:
-        """Check if text looks like a date"""
-        date_patterns = [
-            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
-            r'\d{4}[/-]\d{1,2}[/-]\d{1,2}',
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)',
-        ]
-        return any(re.search(pattern, text, re.IGNORECASE) for pattern in date_patterns)
-    
-    def _extract_addresses_with_boundaries(self, predictions: List[Dict], img_w: int, img_h: int) -> Dict:
-        """Simpler address extraction with strict limits"""
-        result = {"bill_to": "", "ship_to": ""}
-        
-        # Sort predictions by Y position to process in reading order
-        sorted_predictions = sorted(predictions, key=lambda x: (x["center_y"], x["center_x"]))
-        
-        for pred in sorted_predictions:
-            text_lower = pred["text"].lower().strip()
-            
-            # BILL TO - FIXED: Better label matching
-            if "bill" in text_lower:
-                # Look for the actual address content
-                address_text = self._extract_address_content(pred, sorted_predictions, img_w, img_h)
-                if address_text:
-                    result["bill_to"] = address_text
-                    continue  # Don't break, continue to look for ship_to
-            
-            # SHIP TO - FIXED: Better label matching  
-            if "ship" in text_lower and not result["ship_to"]:  # Only set if not already found
-                # Look for the actual address content
-                address_text = self._extract_address_content(pred, sorted_predictions, img_w, img_h)
-                if address_text:
-                    result["ship_to"] = address_text
-        
-        return result
-
-
-    def _extract_addresses_with_boundaries(self, predictions: List[Dict], img_w: int, img_h: int) -> Dict:
-        """Address extraction with column awareness"""
-        result = {"bill_to": "", "ship_to": ""}
-        
-        # First, find ALL address labels and their positions
-        bill_labels = []
-        ship_labels = []
-        
-        for pred in predictions:
-            text_lower = pred["text"].lower().strip()
-            if "bill" in text_lower:
-                bill_labels.append(pred)
-            elif "ship" in text_lower:
-                ship_labels.append(pred)
-        
-        # If we found both labels, determine columns and extract accordingly
-        if bill_labels and ship_labels:
-            # Take the most likely label (first one found in each category)
-            bill_label = bill_labels[0]
-            ship_label = ship_labels[0]
-            
-            # Determine which is left, which is right
-            if bill_label["center_x"] < ship_label["center_x"]:
-                # Normal case: Bill To is left, Ship To is right
-                left_label, right_label = bill_label, ship_label
-                left_field, right_field = "bill_to", "ship_to"
-            else:
-                # Reversed: Ship To is left, Bill To is right
-                left_label, right_label = ship_label, bill_label
-                left_field, right_field = "ship_to", "bill_to"
-            
-            # Calculate midpoint between columns for better separation
-            midpoint_x = (left_label["center_x"] + right_label["center_x"]) / 2
-            
-            # Extract left column (strict left of midpoint)
-            left_content = self._extract_address_content_fixed(
-                left_label, predictions, img_w, img_h, 
-                max_x=midpoint_x - (img_w * 0.05),  # Leave small gap
-                side="left"
-            )
-            
-            # Extract right column (strict right of midpoint)
-            right_content = self._extract_address_content_fixed(
-                right_label, predictions, img_w, img_h,
-                min_x=midpoint_x + (img_w * 0.05),  # Leave small gap
-                side="right"
-            )
-            
-            result[left_field] = left_content
-            result[right_field] = right_content
-        
-        # Fallback: If only one label found, use original method
-        elif bill_labels:
-            result["bill_to"] = self._extract_address_content_fixed(
-                bill_labels[0], predictions, img_w, img_h, side="unknown"
-            )
-        elif ship_labels:
-            result["ship_to"] = self._extract_address_content_fixed(
-                ship_labels[0], predictions, img_w, img_h, side="unknown"
-            )
-        
-        return result
-
-    def _extract_address_content_fixed(self, label_pred: Dict, predictions: List[Dict], 
-                                    img_w: int, img_h: int, 
-                                    max_x: float = None, min_x: float = None,
-                                    side: str = "unknown") -> str:
-        """Extract address content - SIMPLIFIED FIX"""
-        candidates = []
-        
-        # Horizontal tolerance settings
-        if side == "left":
-            horiz_tolerance_left = img_w * 0.15
-            horiz_tolerance_right = img_w * 0.05
-        elif side == "right":
-            horiz_tolerance_left = img_w * 0.05
-            horiz_tolerance_right = img_w * 0.15
-        else:
-            horiz_tolerance_left = img_w * 0.1
-            horiz_tolerance_right = img_w * 0.1
-        
-        # Simple table header filter
-        skip_tokens = {"item", "qty", "quantity", "description", "price", "rate"}
-        
-        for other in predictions:
-            # Skip if above or same level as label
-            if other["center_y"] <= label_pred["center_y"]:
-                continue
-            
-            # Shorter vertical range
-            if other["center_y"] > label_pred["center_y"] + (img_h * 0.15):
-                continue
-            
-            # Horizontal check
-            offset = other["center_x"] - label_pred["center_x"]
-            if offset < 0 and abs(offset) > horiz_tolerance_left:
-                continue
-            if offset >= 0 and offset > horiz_tolerance_right:
-                continue
-            
-            # Column boundaries
-            if max_x and other["center_x"] > max_x:
-                continue
-            if min_x and other["center_x"] < min_x:
-                continue
-            
-            # Skip address labels
-            if self._is_address_label(other["text"]):
-                continue
-            
-            # Skip table headers
-            if other["text"].lower().strip() in skip_tokens:
-                continue
-            
-            # Skip ALL CAPS short words (often headers)
-            if other["text"].isupper() and len(other["text"]) < 8:
-                continue
-            
-            candidates.append(other)
-        
-        if not candidates:
-            return ""
-        
-        # Simple address building
-        return self._build_simple_address(candidates, img_h)
-
-    def _build_simple_address(self, candidates: List[Dict], img_h: int) -> str:
-        """Build address - simple version"""
-        candidates.sort(key=lambda x: x["center_y"])
-        
-        # Group by line
-        lines = {}
-        for token in candidates:
-            y = token["center_y"]
-            line_found = False
-            
-            for line_y in lines.keys():
-                if abs(y - line_y) < img_h * 0.015:
-                    lines[line_y].append(token)
-                    line_found = True
-                    break
-            
-            if not line_found:
-                lines[y] = [token]
-        
-        # Build lines
-        address_lines = []
-        for line_y in sorted(lines.keys()):
-            tokens = sorted(lines[line_y], key=lambda x: x["center_x"])
-            line_text = " ".join(t["text"] for t in tokens).strip()
-            
-            if line_text:
-                address_lines.append(line_text)
-            
-            if len(address_lines) >= 3:
+    # ── Group tokens into sorted lines ───────────────────────────────────────
+    lines: Dict[float, List] = {}
+    for t in tokens:
+        matched = False
+        for y in list(lines.keys()):
+            if abs(t["center_y"] - y) < line_tol:
+                lines[y].append(t)
+                matched = True
                 break
-        
-        return "\n".join(address_lines) if address_lines else ""
+        if not matched:
+            lines[t["center_y"]] = [t]
 
-    def _build_address_from_candidates(self, candidates: List[Dict], img_h: int) -> str:
-        """Build address string from candidate tokens"""
-        # Sort by Y position
-        candidates.sort(key=lambda x: x["center_y"])
-        
-        # Group by line
-        lines = {}
-        line_tolerance = img_h * 0.015
-        
-        for token in candidates:
-            y_pos = token["center_y"]
-            found_line = False
-            
-            for line_y in lines.keys():
-                if abs(y_pos - line_y) < line_tolerance:
-                    lines[line_y].append(token)
-                    found_line = True
-                    break
-            
-            if not found_line:
-                lines[y_pos] = [token]
-        
-        # Build address lines
-        address_lines = []
-        for line_y in sorted(lines.keys()):
-            line_tokens = sorted(lines[line_y], key=lambda x: x["center_x"])
-            line_text = " ".join(t["text"] for t in line_tokens).strip()
-            
-            if line_text:
-                address_lines.append(line_text)
-            
-            if len(address_lines) >= 3:
-                break
-        
-        return "\n".join(address_lines) if address_lines else ""
+    sorted_lines = sorted(lines.items(), key=lambda kv: kv[0])
+    for _, lt in sorted_lines:
+        lt.sort(key=lambda t: t["center_x"])
 
-    def _extract_address_content(self, label_pred: Dict, predictions: List[Dict], img_w: int, img_h: int) -> str:
-        """Deprecated - use _extract_address_content_fixed instead"""
-        return self._extract_address_content_fixed(label_pred, predictions, img_w, img_h, side="unknown")
-
-
-    def _is_address_label(self, text: str) -> bool:
-        """Check if text is an address label (not actual address content) - FIXED"""
-        text_lower = text.lower().strip()
-        
-        # Common address labels
-        label_keywords = ["bill", "ship", "to:", "attention", "attn", "address", "from", "for"]
-        
-        # Check if it's likely a label
-        for keyword in label_keywords:
-            if keyword in text_lower:
-                # Additional checks to avoid false positives
-                words = text.split()
-                
-                # Labels are usually short (1-3 words)
-                if len(words) <= 3:
-                    # Check for common label patterns
-                    if (text_lower.endswith(":") or 
-                        text_lower.endswith("to") or
-                        ":" in text_lower or
-                        text_lower in ["bill", "ship", "attention", "attn"]):
-                        return True
-        
-        return False
-    
-    def _extract_financial_strict(self, predictions: List[Dict], img_w: int, img_h: int) -> Dict:
-        """Strict financial extraction with label verification"""
-        financials = {
-            "subtotal": 0.0, "shipping": 0.0, "tax": 0.0, 
-            "discount": 0.0, "total_amount": 0.0, "balance_due": 0.0
-        }
-        
-        print(f"\n💰 STRICT FINANCIAL EXTRACTION")
-        
-        # Field patterns with strict matching
-        field_patterns = [
-            ("subtotal", ["sub.?total", "amount before tax", "merchandise", "product total"]),
-            ("shipping", ["shipping", "freight", "delivery", "handling", "ship"]),
-            ("tax", ["tax", "vat", "gst", "sales tax", "taxable"]),
-            ("discount", ["discount", "less", "deduction", "adjustment", "promo"]),
-            ("total_amount", ["total", "amount due", "balance due", "net due", "payable", "grand total"]),
-            ("balance_due", ["balance due", "amount due", "payable", "net due"]),
-        ]
-        
-        # First pass: Find all potential labels
-        all_labels = []
-        for pred in predictions:
-            text_lower = pred["text"].lower()
-            for field_name, patterns in field_patterns:
-                if any(re.search(pattern, text_lower) for pattern in patterns):
-                    all_labels.append((field_name, pred))
-        
-        # Group labels by Y position (rows)
-        rows = {}
-        row_tolerance = img_h * 0.02
-        
-        for field_name, label in all_labels:
-            row_found = False
-            for row_y in rows.keys():
-                if abs(label["center_y"] - row_y) < row_tolerance:
-                    rows[row_y].append((field_name, label))
-                    row_found = True
-                    break
-            if not row_found:
-                rows[label["center_y"]] = [(field_name, label)]
-        
-        # For each row, find the amount to the right
-        for row_y, row_labels in rows.items():
-            # Find numeric tokens to the right of labels
-            for field_name, label in row_labels:
-                # Look for amount in same row (similar Y)
-                candidate_amounts = []
-                for pred in predictions:
-                    if (pred.get("is_numeric") and
-                        pred["center_x"] > label["center_x"] and
-                        abs(pred["center_y"] - row_y) < row_tolerance * 2 and
-                        pred["center_x"] < label["center_x"] + img_w * 0.4):
-                        
-                        amount = self._parse_currency(pred["text"])
-                        if amount > 0:
-                            candidate_amounts.append((amount, pred))
-                
-                # Take closest amount to the right
-                if candidate_amounts:
-                    candidate_amounts.sort(key=lambda x: abs(x[1]["center_x"] - label["center_x"]))
-                    best_amount, best_token = candidate_amounts[0]
-                    
-                    # Only update if we don't have this field yet or this is a better match
-                    if financials[field_name] == 0.0 or field_name == "total_amount":
-                        financials[field_name] = best_amount
-                        print(f"   ✅ {field_name:15} = ${best_amount:.2f} | Label: '{label['text']}'")
-        
-        # If total not found, try bottom 15% of invoice
-        if financials["total_amount"] == 0.0:
-            bottom_y = img_h * 0.85
-            bottom_amounts = []
-            for pred in predictions:
-                if pred.get("is_numeric") and pred["center_y"] > bottom_y:
-                    amount = self._parse_currency(pred["text"])
-                    if amount > 100:  # Total should be significant
-                        bottom_amounts.append((amount, pred))
-            
-            if bottom_amounts:
-                bottom_amounts.sort(key=lambda x: x[0], reverse=True)  # Largest amount
-                financials["total_amount"] = bottom_amounts[0][0]
-                print(f"   ⚠️  total_amount   = ${bottom_amounts[0][0]:.2f} (inferred from bottom)")
-        
-        # If shipping looks wrong (too high, might be line item), set to 0
-        if financials["shipping"] > financials["total_amount"] * 0.5:  # Shipping > 50% of total is suspicious
-            print(f"   ⚠️  shipping amount ${financials['shipping']:.2f} looks wrong, setting to 0")
-            financials["shipping"] = 0.0
-        
-        return financials
-    
-    def _extract_order_id_comprehensive(self, predictions: List[Dict], img_w: int, img_h: int) -> str:
-        """Fixed Order ID extraction with proper spatial relationships"""
-        
-        # Step 1: Find the EXACT "Order ID:" label
-        order_label_tokens = []
-        
-        for pred in predictions:
-            text_lower = pred["text"].lower().strip()
-            
-            # Look for exact "Order ID" or similar patterns
-            if (text_lower == "order" or 
-                text_lower == "order id" or 
-                text_lower == "order id:" or
-                text_lower.startswith("order id")):
-                order_label_tokens.append(pred)
-        
-        print(f"🔍 Found {len(order_label_tokens)} Order ID label tokens")
-        
-        # Step 2: For each Order ID label, find the value to its RIGHT on the SAME line
-        for label_token in order_label_tokens:
-            print(f"  Checking Order ID label: '{label_token['text']}' at ({int(label_token['center_x'])}, {int(label_token['center_y'])})")
-            
-            # Look for tokens on the SAME line (strict vertical tolerance)
-            same_line_tokens = []
-            line_tolerance = img_h * 0.01  # Very strict: only 1% height difference
-            
-            for pred in predictions:
-                if pred is label_token:
-                    continue
-                    
-                # Check if on EXACT same line
-                if abs(pred["center_y"] - label_token["center_y"]) < line_tolerance:
-                    same_line_tokens.append(pred)
-            
-            if not same_line_tokens:
-                print(f"    No tokens on same line found")
-                continue
-            
-            # Sort by X position (left to right)
-            same_line_tokens.sort(key=lambda x: x["center_x"])
-            
-            # Find the Order ID label position in the line
-            line_tokens = same_line_tokens.copy()
-            line_tokens.append(label_token)
-            line_tokens.sort(key=lambda x: x["center_x"])
-            
-            # Find tokens to the RIGHT of the Order ID label
-            tokens_to_right = []
-            for token in line_tokens:
-                if token["center_x"] > label_token["center_x"]:
-                    tokens_to_right.append(token)
-            
-            print(f"    Found {len(tokens_to_right)} tokens to the right of label")
-            
-            # Step 3: Extract the value (first meaningful token to the right)
-            if tokens_to_right:
-                # The value is usually the first token to the right
-                first_right = tokens_to_right[0]
-                value = first_right["text"].strip()
-                
-                # Clean up common separators
-                if value.startswith(":") or value.startswith("#"):
-                    value = value[1:].strip()
-                
-                # Check if this looks like an Order ID
-                if self._is_valid_order_id(value):
-                    print(f"✅ Order ID found: '{value}'")
-                    return value
-                
-                # Sometimes the value might be in multiple tokens (e.g., "CA-2012-AT10735140-41150" split)
-                # Try combining tokens to the right
-                combined_value = ""
-                for token in tokens_to_right[:5]:  # Combine up to 5 tokens to the right
-                    token_text = token["text"].strip()
-                    
-                    # Skip separators
-                    if token_text in [":", "#", "-", ":", ";"]:
-                        continue
-                        
-                    # Check if this token looks like part of an Order ID
-                    if re.match(r'^[A-Z0-9\-]+$', token_text):
-                        if combined_value:
-                            combined_value += " " + token_text
-                        else:
-                            combined_value = token_text
-                    else:
-                        break  # Stop if we hit non-ID text
-                
-                if combined_value and self._is_valid_order_id(combined_value):
-                    print(f"✅ Order ID (combined): '{combined_value}'")
-                    return combined_value
-        
-        # Step 4: Fallback - Look for Order ID patterns with context
-        print("⚠️  Trying fallback pattern matching...")
-        
-        # Improved patterns that match "Order ID: VALUE"
-        patterns = [
-            r'(?:order\s*id|Order\s*ID)[\s:]*([A-Z0-9\-]{6,})',
-            r'(?:order\s*id|Order\s*ID)[\s:]*([A-Z]{2}-\d{4}-[A-Z0-9\-]+)',  # CA-2012-AT10735140-41150
-            r'Order\s*ID\s*[:#]\s*([A-Z0-9\-]{6,})',
-            r'(?:PO|P\.?O\.?)[\s:]*([A-Z0-9\-]{6,})',
-            r'#\s*([A-Z0-9\-]{6,})',
-        ]
-        
-        # Group tokens by very tight lines
-        lines = {}
-        tight_tolerance = img_h * 0.008  # 0.8% height tolerance
-        
-        for pred in predictions:
-            y_key = round(pred["center_y"] / tight_tolerance)
-            if y_key not in lines:
-                lines[y_key] = []
-            lines[y_key].append(pred)
-        
-        # Check each line
-        for line_key in sorted(lines.keys()):
-            tokens = sorted(lines[line_key], key=lambda x: x["center_x"])
-            combined_line = " ".join(t["text"] for t in tokens)
-            
-            for pattern in patterns:
-                match = re.search(pattern, combined_line, re.IGNORECASE)
-                if match:
-                    order_id = match.group(1).strip()
-                    if self._is_valid_order_id(order_id):
-                        print(f"✅ Order ID (line pattern): '{order_id}' from line: '{combined_line[:50]}...'")
-                        return order_id
-        
-        return ""
-
-    def _is_valid_order_id(self, text: str) -> bool:
-        """Strict validation for Order IDs"""
-        if not text or len(text) < 6:  # Order IDs are usually at least 6 chars
-            return False
-        
-        # Remove common separators and whitespace
-        clean = re.sub(r'[\s:;#]', '', text)
-        
-        # Common false positives
-        false_positives = ["invoice", "date", "due", "total", "amount", "terms", "payment"]
-        if clean.lower() in false_positives:
-            return False
-        
-        # Check if it looks like a date
-        if self._looks_like_date(clean):
-            return False
-        
-        # Check if it looks like a currency amount
-        if re.match(r'^[\$\€\£]?\d+\.?\d*$', clean):
-            return False
-        
-        # Order ID patterns
-        patterns = [
-            r'^[A-Z]{2,3}-\d{4}-[A-Z0-9\-]+$',  # CA-2012-AT10735140-41150
-            r'^[A-Z]{2,}\d{6,}$',  # ABC123456
-            r'^\d{6,}$',  # 123456789
-            r'^[A-Z0-9]{6,}-[A-Z0-9\-]+$',  # Mixed with dashes
-            r'^PO\d{6,}$',  # PO123456
-        ]
-        
-        for pattern in patterns:
-            if re.match(pattern, clean, re.IGNORECASE):
-                return True
-        
-        # If it has good mix of letters and numbers, and reasonable length
-        letter_count = sum(1 for c in clean if c.isalpha())
-        digit_count = sum(1 for c in clean if c.isdigit())
-        
-        if letter_count >= 2 and digit_count >= 3 and len(clean) >= 8:
-            return True
-        
-        return False
-    
-    def _extract_notes(self, predictions: List[Dict], img_h: int) -> str:
-        """Extract notes only - stop at Terms/Order ID sections"""
-        notes_keywords = ["notes", "remarks", "comments"]
-        
-        # Find notes label
-        notes_label = None
-        for pred in predictions:
-            text_lower = pred["text"].lower()
-            if any(keyword in text_lower for keyword in notes_keywords):
-                notes_label = pred
-                break
-        
-        if not notes_label:
-            return ""
-        
-        # Group all tokens by line
-        all_lines = {}
-        line_tolerance = img_h * 0.02
-        
-        for pred in predictions:
-            y = pred["center_y"]
-            line_found = False
-            
-            for line_y in all_lines.keys():
-                if abs(y - line_y) < line_tolerance:
-                    all_lines[line_y].append(pred)
-                    line_found = True
-                    break
-            
-            if not line_found:
-                all_lines[y] = [pred]
-        
-        # Sort lines by Y position
-        sorted_lines = sorted(all_lines.items(), key=lambda x: x[0])
-        
-        # Find the line with the notes label
-        notes_line_idx = -1
-        for idx, (line_y, tokens) in enumerate(sorted_lines):
-            for token in tokens:
-                if token is notes_label:  # Compare by object reference
-                    notes_line_idx = idx
-                    break
-            if notes_line_idx != -1:
-                break
-        
-        if notes_line_idx == -1:
-            return ""
-        
-        # Collect note lines starting from line after the notes label
-        notes_lines = []
-        section_starters = ["terms", "order", "ship", "bill", "payment", "due", "attention"]
-        
-        for i in range(notes_line_idx + 1, min(notes_line_idx + 8, len(sorted_lines))):
-            line_y, tokens = sorted_lines[i]
-            
-            # Sort tokens in line left to right
-            tokens.sort(key=lambda x: x["center_x"])
-            line_text = " ".join(t["text"] for t in tokens).strip()
-            
-            # Skip the "Notes:" label itself if it appears again
-            if any(keyword in line_text.lower() for keyword in notes_keywords):
-                continue
-            
-            # Stop if we hit a new section
-            line_lower = line_text.lower()
-            if any(starter in line_lower for starter in section_starters):
-                break
-            
-            # Skip empty lines
-            if line_text:
-                notes_lines.append(line_text)
-        
-        # Join and return
-        return "\n".join(notes_lines)
-    
-    def _extract_payment_terms_improved(self, predictions: List[Dict], img_w: int, img_h: int) -> str:
-        """Improved payment terms extraction using spatial positioning"""
-        # Payment term label patterns
-        payment_labels = [
-            "payment terms", "terms", "net", "due", "payable", "balance due",
-            "terms:", "payment:", "net due", "due date", "ship mode", "ship terms"
-        ]
-        
-        # First, look for "Ship Mode:" to know where to search
-        ship_mode_token = None
-        for pred in predictions:
-            if "ship mode" in pred["text"].lower():
-                ship_mode_token = pred
-                break
-        
-        # If we found "Ship Mode:", search near it (same row or below)
-        if ship_mode_token:
-            # Look for payment terms in same area as Ship Mode
-            search_area_top = ship_mode_token["center_y"] - (img_h * 0.05)
-            search_area_bottom = ship_mode_token["center_y"] + (img_h * 0.15)
-            
-            # Get tokens in this area
-            area_tokens = [
-                p for p in predictions
-                if search_area_top < p["center_y"] < search_area_bottom
-            ]
-            
-            # Look for payment term labels in this area
-            for pred in area_tokens:
-                text_lower = pred["text"].lower()
-                
-                # Check if token is a payment term label
-                is_label = any(label in text_lower for label in payment_labels)
-                
-                if is_label:
-                    # Look for value to the RIGHT of this label
-                    value = self._extract_value_right_of_label(pred, area_tokens, img_w, img_h)
-                    if value:
-                        return value
-        
-        # Fallback: Search entire invoice, focusing on right side
-        # Payment terms are often on the right side of invoices
-        right_side_tokens = [p for p in predictions if p["center_x"] > img_w * 0.6]
-        
-        for pred in right_side_tokens:
-            text_lower = pred["text"].lower()
-            
-            # Check if token is a payment term label
-            is_label = any(label in text_lower for label in payment_labels)
-            
-            if is_label:
-                # Extract value to the right
-                value = self._extract_value_right_of_label(pred, predictions, img_w, img_h)
-                if value:
-                    # Clean up the value - remove the label if it's included
-                    for label in payment_labels:
-                        if label in value.lower():
-                            # Try to extract just the value part
-                            parts = re.split(r':|[-–]', value, maxsplit=1)
-                            if len(parts) > 1:
-                                return parts[1].strip()
-                    return value
-        
-        # Legacy pattern matching (fallback)
-        term_patterns = [
-            r'(?:payment\s+terms|terms|net|balance\s+due)[:\s-]*([^\n]+)',
-            r'(?:net\s+)(\d+)\s*(?:days?|d)',
-            r'(?:due\s+in\s+)(\d+)\s*days',
-            r'(\d+)\s*%\s*\d+\s*days',
-            r'(?:COD|Cash\s+on\s+Delivery)',
-            r'(?:due\s+(?:upon|on)\s+(?:receipt|delivery|invoice))',
-        ]
-        
-        for pred in predictions:
-            text = pred["text"]
-            for pattern in term_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    # Return the CAPTURED GROUP (value), not the entire text
-                    if match.groups():
-                        return match.group(1).strip()
-                    # If no capture group, return the full match
-                    return match.group(0).strip()
-        
-        return ""
-
-    def _extract_value_right_of_label(self, label_token: Dict, predictions: List[Dict], img_w: int, img_h: int) -> str:
-        """Extract value to the right of a label on the same row"""
-        
-        # Find tokens on the same row (similar Y position)
-        row_tolerance = img_h * 0.02
-        same_row_tokens = [
-            p for p in predictions
-            if abs(p["center_y"] - label_token["center_y"]) < row_tolerance
-            and p["center_x"] > label_token["center_x"]
-            and p["center_x"] < label_token["center_x"] + (img_w * 0.3)  # Within 30% to the right
-        ]
-        
-        if not same_row_tokens:
-            return ""
-        
-        # Sort by X position (left to right)
-        same_row_tokens.sort(key=lambda x: x["center_x"])
-        
-        # Take the first token to the right (closest to label)
-        first_right_token = same_row_tokens[0]
-        
-        # Check if this token looks like a value (not another label)
-        text_lower = first_right_token["text"].lower()
-        payment_labels = ["payment terms", "terms", "net", "due", "payable", "balance due"]
-        
-        # If it's another label, skip it and look further right
-        if any(label in text_lower for label in payment_labels):
-            if len(same_row_tokens) > 1:
-                return same_row_tokens[1]["text"]
-            return ""
-        
-        return first_right_token["text"]
-    
-    def _extract_line_items_table(self, predictions: List[Dict], img_w: int, img_h: int) -> List[Dict]:
-        """Robust line item extraction using spatial table detection"""
-        print(f"🔍 Starting robust line item extraction...")
-        
-        items = []
-        
-        # Step 1: Find the item section by looking for table structure
-        # Look for "Item" or "Description" header
-        item_header = None
-        for pred in predictions:
-            text_lower = pred["text"].lower()
-            if text_lower in ["item", "description", "product", "part"]:
-                item_header = pred
-                break
-        
-        # Step 2: Find quantity/rate/amount headers
-        qty_header = None
-        rate_header = None
-        amt_header = None
-        qty_keywords = ["qty", "quantity", "qty."]
-        rate_keywords = ["rate", "price", "unit", "each"]
-        amt_keywords = ["amount", "total", "amt", "extended"]
-        
-        for pred in predictions:
-            text_lower = pred["text"].lower()
-            if any(kw in text_lower for kw in qty_keywords):
-                qty_header = pred
-            elif any(kw in text_lower for kw in rate_keywords):
-                rate_header = pred
-            elif any(kw in text_lower for kw in amt_keywords):
-                amt_header = pred
-        
-        # Step 3: If we found headers, use them to define table structure
-        if qty_header or rate_header or amt_header:
-            print("✅ Found table headers - using table detection method")
-            items = self._extract_items_with_table_structure(predictions, img_w, img_h, 
-                                                            item_header, qty_header, rate_header, amt_header)
-        
-        # Step 4: If no headers found, use spatial clustering
-        if not items:
-            print("⚠️  No table headers found - using spatial clustering method")
-            items = self._extract_items_with_spatial_clustering(predictions, img_w, img_h)
-        
-        # Step 5: If still no items, use pattern-based extraction
-        if not items:
-            print("⚠️  No items with spatial clustering - using pattern matching")
-            items = self._extract_items_with_pattern_matching(predictions, img_w, img_h)
-        
-        print(f"📦 Extracted {len(items)} line items")
-        return items
-
-    def _extract_items_with_table_structure(self, predictions: List[Dict], img_w: int, img_h: int,
-                                            item_header, qty_header, rate_header, amt_header):
-        """Extract items using detected table structure with multi-line description support"""
-        items = []
-        
-        # Determine table boundaries
-        table_top = img_h * 0.3
-        table_bottom = img_h * 0.7
-        
-        if item_header:
-            table_top = item_header["center_y"] + (img_h * 0.02)
-        
-        # Look for summary section to determine table bottom
-        summary_keywords = ["subtotal", "total", "balance", "shipping", "tax"]
-        for pred in predictions:
-            if any(kw in pred["text"].lower() for kw in summary_keywords):
-                if pred["center_y"] > table_top:
-                    table_bottom = min(table_bottom, pred["center_y"] - (img_h * 0.02))
-                    break
-        
-        # Get all tokens in table region
-        table_tokens = [p for p in predictions if table_top < p["center_y"] < table_bottom]
-        
-        if not table_tokens:
-            return []
-        
-        # Step 1: Find numeric columns
-        numeric_tokens = [t for t in table_tokens if t.get("is_numeric")]
-        
-        if not numeric_tokens:
-            return []
-        
-        # Cluster numeric tokens by X position (columns)
-        columns = self._cluster_by_x_position(numeric_tokens, img_w * 0.05)
-        
-        print(f"   Found {len(columns)} numeric columns")
-        
-        # NEW: Group tokens by Y position to find rows
-        all_row_tokens = table_tokens.copy()
-        rows = self._cluster_by_y_position(all_row_tokens, img_h * 0.02)
-        
-        print(f"   Found {len(rows)} potential rows")
-        
-        # NEW: Identify which rows contain numeric values (actual item rows)
-        item_rows = []
-        for row_y, row_tokens in sorted(rows.items()):
-            row_numerics = [t for t in row_tokens if t.get("is_numeric")]
-            if row_numerics:
-                item_rows.append({
-                    'y': row_y,
-                    'tokens': row_tokens,
-                    'numerics': row_numerics
-                })
-        
-        print(f"   Found {len(item_rows)} item rows with numeric values")
-        
-        # Process each item row
-        for item_row in item_rows:
-            row_tokens = item_row['tokens']
-            row_numerics = item_row['numerics']
-            
-            # Sort tokens in row by X position
-            row_tokens.sort(key=lambda x: x["center_x"])
-            
-            # Extract components
-            description_parts = []
-            quantity = 0
-            rate = 0.0
-            amount = 0.0
-            
-            # NEW: Look for multi-line descriptions
-            # Get the description token(s) in this row (non-numeric, longer text)
-            row_description_tokens = [t for t in row_tokens 
-                                    if not t.get("is_numeric") 
-                                    and len(t["text"]) > 3]
-            
-            if row_description_tokens:
-                # Add the main description from this row
-                main_desc_token = row_description_tokens[0]  # Usually the first non-numeric
-                description_parts.append(main_desc_token["text"])
-                
-                # NEW: Look for continuation lines (tokens directly below this one)
-                # Check if there are tokens directly below this description that might be continuation
-                desc_bottom_y = main_desc_token["center_y"] + (img_h * 0.02)
-                
-                # Find tokens that are aligned with this description (similar X position)
-                # and are below it but not too far (within typical line spacing)
-                continuation_tokens = []
-                for y_key, other_row_tokens in rows.items():
-                    # Skip if it's the same row
-                    if y_key == item_row['y']:
-                        continue
-                    
-                    # Check if this row is below our current row
-                    if y_key > item_row['y']:
-                        # Check if any tokens in this row are aligned with our description
-                        for token in other_row_tokens:
-                            # Check X alignment (within description column width)
-                            x_diff = abs(token["center_x"] - main_desc_token["center_x"])
-                            if (x_diff < img_w * 0.1 and  # Aligned horizontally
-                                not token.get("is_numeric") and  # Not numeric
-                                len(token["text"]) > 2):  # Meaningful text
-                                
-                                # Also check that this token isn't part of another item
-                                # (no numeric values in its row)
-                                other_row_numerics = [t for t in other_row_tokens if t.get("is_numeric")]
-                                if not other_row_numerics:
-                                    continuation_tokens.append(token)
-                                    # Break after finding first continuation token in this row
-                                    break
-                
-                # Sort continuation tokens by Y position and add to description
-                if continuation_tokens:
-                    continuation_tokens.sort(key=lambda x: x["center_y"])
-                    for cont_token in continuation_tokens:
-                        description_parts.append(cont_token["text"])
-            
-            # Parse numeric values (same as before)
-            if len(row_numerics) >= 3:
-                # Likely: Qty, Rate, Amount
-                quantity = self._parse_quantity(row_numerics[0]["text"])
-                rate = self._parse_currency(row_numerics[1]["text"])
-                amount = self._parse_currency(row_numerics[2]["text"])
-            elif len(row_numerics) == 2:
-                # Determine which is which by position and value
-                val1 = self._parse_currency(row_numerics[0]["text"])
-                val2 = self._parse_currency(row_numerics[1]["text"])
-                
-                # Heuristic: smaller whole number is quantity
-                if val1 < 100 and val1 == int(val1):
-                    quantity = int(val1)
-                    amount = val2
-                    if quantity > 0 and amount > 0:
-                        rate = amount / quantity
-                else:
-                    # Might be rate and amount
-                    rate = val1
-                    amount = val2
-            
-            # Combine description parts
-            if description_parts:
-                description = " ".join(description_parts)
-                
-                # Validate this looks like a real item
-                if self._is_valid_item_description(description):
-                    items.append({
-                        "description": description,
-                        "quantity": quantity,
-                        "rate": rate,
-                        "amount": amount,
-                    })
-                    print(f"   ✅ Table item: '{description[:40]}...' (Qty: {quantity}, Amt: ${amount:.2f})")
-        
-        return items
-
-    def _extract_items_with_spatial_clustering(self, predictions: List[Dict], img_w: int, img_h: int):
-        """Extract items by clustering tokens spatially"""
-        items = []
-        
-        # Filter out non-item tokens
-        item_tokens = []
-        non_item_keywords = ["bill", "ship", "date", "mode", "balance", "total", "subtotal", "shipping", "tax", "address"]
-        
-        for pred in predictions:
-            text_lower = pred["text"].lower()
-            is_non_item = any(kw in text_lower for kw in non_item_keywords)
-            
-            if not is_non_item and pred["center_y"] > img_h * 0.2 and pred["center_y"] < img_h * 0.8:
-                item_tokens.append(pred)
-        
-        if not item_tokens:
-            return []
-        
-        # Cluster tokens by Y position to find rows
-        rows = self._cluster_by_y_position(item_tokens, img_h * 0.02)
-        
-        # Also cluster by X position to find columns
-        all_tokens_sorted = sorted(item_tokens, key=lambda x: x["center_x"])
-        columns = self._cluster_by_x_position(all_tokens_sorted, img_w * 0.05)
-        
-        print(f"   Spatial: Found {len(rows)} rows, {len(columns)} columns")
-        
-        # Process each row
-        for row_y, row_tokens in sorted(rows.items()):
-            if len(row_tokens) < 2:
-                continue
-            
-            # Sort row tokens by X
-            row_tokens.sort(key=lambda x: x["center_x"])
-            
-            # Skip if this looks like a header
-            header_keywords = ["item", "qty", "quantity", "rate", "price", "amount", "total"]
-            is_header = any(any(kw in t["text"].lower() for kw in header_keywords) for t in row_tokens[:3])
-            if is_header:
-                continue
-            
-            # Check for item characteristics
-            has_text = any(not t.get("is_numeric") and len(t["text"]) > 3 for t in row_tokens)
-            has_number = any(t.get("is_numeric") for t in row_tokens)
-            
-            if not (has_text and has_number):
-                continue
-            
-            # Extract data
-            description_parts = []
-            numeric_values = []
-            
-            for token in row_tokens:
-                if token.get("is_numeric"):
-                    numeric_values.append(token)
-                elif len(token["text"]) > 2:
-                    description_parts.append(token["text"])
-            
-            if not description_parts:
-                continue
-            
-            description = " ".join(description_parts)
-            
-            # Parse numeric values
-            quantity = 0
-            rate = 0.0
-            amount = 0.0
-            
-            if numeric_values:
-                numeric_values.sort(key=lambda x: x["center_x"])
-                
-                if len(numeric_values) >= 3:
-                    quantity = self._parse_quantity(numeric_values[0]["text"])
-                    rate = self._parse_currency(numeric_values[1]["text"])
-                    amount = self._parse_currency(numeric_values[2]["text"])
-                elif len(numeric_values) == 2:
-                    val1 = self._parse_currency(numeric_values[0]["text"])
-                    val2 = self._parse_currency(numeric_values[1]["text"])
-                    
-                    # Heuristic
-                    if val1 < 100 and val1 == int(val1):
-                        quantity = int(val1)
-                        amount = val2
-                    else:
-                        amount = val1
-                elif len(numeric_values) == 1:
-                    val = self._parse_currency(numeric_values[0]["text"])
-                    if val < 100 and val == int(val):
-                        quantity = int(val)
-                    else:
-                        amount = val
-            
-            # Check if this is a valid item
-            if self._is_valid_item_description(description):
-                items.append({
-                    "description": description,
-                    "quantity": quantity,
-                    "rate": rate,
-                    "amount": amount,
-                })
-                print(f"   ✅ Spatial item: '{description[:40]}...'")
-        
-        return items
-
-    def _extract_items_with_pattern_matching(self, predictions: List[Dict], img_w: int, img_h: int):
-        """Extract items using pattern matching and contextual analysis"""
-        items = []
-        
-        # Look for product-like patterns
-        product_patterns = [
-            # Multi-word patterns with mixed case
-            r'^[A-Z][a-z]+\s+[A-Z][a-z]+\s+[A-Z]',
-            # Contains common product terms
-            r'.*(box|storage|supply|item|product|part|sku).*',
-            # Long text (likely description)
-            r'^.{15,}$',
-            # Contains model/sku patterns
-            r'.*[A-Z]{2,}-\d+.*',
-        ]
-        
-        # Find candidate descriptions
-        candidate_descriptions = []
-        
-        for pred in predictions:
-            text = pred["text"].strip()
-            
-            # Skip if too short or looks like metadata
-            if len(text) < 8 or any(label in text.lower() for label in ["bill", "ship", "date", "total"]):
-                continue
-            
-            # Check if text matches product patterns
-            for pattern in product_patterns:
-                if re.search(pattern, text, re.IGNORECASE):
-                    candidate_descriptions.append(pred)
-                    break
-        
-        # For each candidate description, find associated numeric values
-        for desc_pred in candidate_descriptions:
-            # Look for numeric values near this description
-            search_top = desc_pred["center_y"] - (img_h * 0.05)
-            search_bottom = desc_pred["center_y"] + (img_h * 0.1)
-            search_left = desc_pred["center_x"]
-            search_right = desc_pred["center_x"] + (img_w * 0.5)
-            
-            nearby_numerics = []
-            for pred in predictions:
-                if (pred.get("is_numeric") and
-                    search_top < pred["center_y"] < search_bottom and
-                    search_left < pred["center_x"] < search_right):
-                    nearby_numerics.append(pred)
-            
-            if not nearby_numerics:
-                continue
-            
-            # Sort numerics by X position
-            nearby_numerics.sort(key=lambda x: x["center_x"])
-            
-            # Parse values
-            quantity = 0
-            rate = 0.0
-            amount = 0.0
-            
-            if len(nearby_numerics) >= 3:
-                quantity = self._parse_quantity(nearby_numerics[0]["text"])
-                rate = self._parse_currency(nearby_numerics[1]["text"])
-                amount = self._parse_currency(nearby_numerics[2]["text"])
-            elif len(nearby_numerics) == 2:
-                val1 = self._parse_currency(nearby_numerics[0]["text"])
-                val2 = self._parse_currency(nearby_numerics[1]["text"])
-                
-                if val1 < 100 and val1 == int(val1):
-                    quantity = int(val1)
-                    amount = val2
-                else:
-                    amount = val1
-            elif len(nearby_numerics) == 1:
-                val = self._parse_currency(nearby_numerics[0]["text"])
-                if val < 100 and val == int(val):
-                    quantity = int(val)
-                else:
-                    amount = val
-            
-            # Create item
-            items.append({
-                "description": desc_pred["text"],
-                "quantity": quantity,
-                "rate": rate,
-                "amount": amount,
-            })
-            
-            print(f"   ✅ Pattern item: '{desc_pred['text'][:40]}...'")
-            
-            # Limit to 5 items
-            if len(items) >= 5:
-                break
-        
-        return items
-
-    def _cluster_by_y_position(self, tokens: List[Dict], tolerance: float) -> Dict:
-        """Cluster tokens by Y position (rows)"""
-        clusters = {}
-        
-        for token in tokens:
-            y_key = round(token["center_y"] / tolerance)
-            if y_key not in clusters:
-                clusters[y_key] = []
-            clusters[y_key].append(token)
-        
-        return clusters
-
-    def _cluster_by_x_position(self, tokens: List[Dict], tolerance: float) -> List[List[Dict]]:
-        """Cluster tokens by X position (columns)"""
-        if not tokens:
-            return []
-        
-        sorted_tokens = sorted(tokens, key=lambda x: x["center_x"])
-        
-        columns = []
-        current_col = [sorted_tokens[0]]
-        
-        for i in range(1, len(sorted_tokens)):
-            token = sorted_tokens[i]
-            prev_token = sorted_tokens[i-1]
-            
-            if abs(token["center_x"] - prev_token["center_x"]) < tolerance:
-                current_col.append(token)
-            else:
-                columns.append(current_col)
-                current_col = [token]
-        
-        if current_col:
-            columns.append(current_col)
-        
-        return columns
-
-    def _is_valid_item_description(self, description: str) -> bool:
-        """Validate if text looks like a real product description"""
-        if not description or len(description) < 5:
-            return False
-        
-        text_lower = description.lower()
-        
-        # Common false positives to exclude
-        false_positives = [
-            "bill to", "ship to", "address", "date", "order", 
-            "invoice", "total", "subtotal", "balance", "due",
-            "payment", "terms", "thank", "page", "attention",
-        ]
-        
-        for fp in false_positives:
-            if fp in text_lower:
-                return False
-        
-        # Check for product-like characteristics
-        # 1. Has letters (not just numbers/symbols)
-        if not any(c.isalpha() for c in description):
-            return False
-        
-        # 2. Not just a number or currency
-        if re.match(r'^[\$\€\£]?\s*\d+\.?\d*$', description):
-            return False
-        
-        # 3. Not a date
-        date_patterns = [
-            r'\d{1,2}/\d{1,2}/\d{2,4}',
-            r'\d{4}-\d{1,2}-\d{1,2}',
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)',
-        ]
-        
-        for pattern in date_patterns:
-            if re.search(pattern, description, re.IGNORECASE):
-                return False
-        
-        # 4. Good mix of characters for a product
-        word_count = len(description.split())
-        if word_count >= 2:  # Multi-word descriptions are more likely products
-            return True
-        
-        # Single word but looks product-like (e.g., "Widget-X123")
-        if re.search(r'[A-Za-z]+[-_][A-Za-z0-9]+', description):
-            return True
-        
-        return True
-    
-    def _parse_quantity(self, text: str) -> int:
-        """Parse quantity as integer"""
-        match = re.search(r'[\d.]+', text)
-        if match:
-            try:
-                return int(float(match.group(0)))
-            except:
-                pass
-        return 0
-    
-    def _extract_invoice_number(self, predictions: List[Dict], img_w: int, img_h: int) -> str:
-        """Extract invoice number - FIXED to prioritize # patterns"""
-        patterns = [
-            # Prioritize # patterns first
-            r'#\s*([A-Z0-9\-]{3,})',
-            r'INV[OICE]*[\s#:]*([A-Z0-9\-]{3,})',
-            r'Invoice[\s#:]*([A-Z0-9\-]{3,})',
-            r'No\.?\s*[:#]?\s*([A-Z0-9\-]{3,})',
-            r'(\d{3,}[-_]\d+)',
-        ]
-        
-        # Search in specific areas with priority
-        search_areas = [
-            # Area 1: Top-right (most common for invoice numbers)
-            [p for p in predictions if p["center_y"] < img_h * 0.3 and p["center_x"] > img_w * 0.6],
-            # Area 2: Anywhere with # symbol
-            [p for p in predictions if '#' in p["text"]],
-            # Area 3: All predictions (fallback)
-            predictions
-        ]
-        
-        for search_space in search_areas:
-            for token in search_space:
-                text = token["text"]
-                
-                # DEBUG
-                # print(f"DEBUG invoice token: '{text}'")
-                
-                for pattern in patterns:
-                    match = re.search(pattern, text, re.IGNORECASE)
-                    if match:
-                        invoice_num = match.group(1) if match.groups() else match.group(0)
-                        
-                        # Validate it's not something else
-                        if invoice_num and len(invoice_num) >= 3:
-                            # Skip if it looks like a date or other common false positives
-                            if (not re.match(r'^\d{1,2}[/-]\d', invoice_num) and  # Not date
-                                not invoice_num.upper() in ['ICE', 'DATE', 'DUE', 'TOTAL'] and  # Not labels
-                                not self._looks_like_date(invoice_num)):
-                                # print(f"DEBUG: Found invoice number: {invoice_num}")
-                                return invoice_num
-        
-        # If not found, check vendor tokens for embedded invoice numbers
-        vendor_area = [p for p in predictions if p["center_y"] < img_h * 0.2 and p["center_x"] < img_w * 0.4]
-        for token in vendor_area:
-            # Look for # pattern in vendor text
-            match = re.search(r'#\s*(\d{3,})', token["text"])
-            if match:
-                return f"#{match.group(1)}"
-        
-        return ""
-        
-    def _extract_dates(self, predictions: List[Dict]) -> List[str]:
-        """Extract date strings"""
-        dates = []
-        patterns = [
-            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
-            r'\d{4}[/-]\d{1,2}[/-]\d{1,2}',
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}',
-            r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}',
-        ]
-        
-        for pred in predictions:
-            for pattern in patterns:
-                if re.search(pattern, pred["text"], re.IGNORECASE):
-                    dates.append(pred["text"])
-                    break
-        
-        return dates[:2]
-    
-    def _parse_currency(self, text: str) -> float:
-        """Parse currency value to float"""
-        match = re.search(r'[\d,]+\.?\d*', text)
-        if not match:
-            return 0.0
-        
-        num_str = match.group(0)
-        
-        if ',' in num_str and '.' in num_str:
-            if num_str.rfind(',') > num_str.rfind('.'):
-                num_str = num_str.replace('.', '').replace(',', '.')
-            else:
-                num_str = num_str.replace(',', '')
-        elif ',' in num_str:
-            parts = num_str.split(',')
-            if len(parts) == 2 and len(parts[1]) == 2:
-                num_str = num_str.replace(',', '.')
-            else:
-                num_str = num_str.replace(',', '')
-        
+    def parse_float(text: str) -> float:
+        cleaned = re.sub(r"[^\d.]", "", text)
         try:
-            return float(num_str)
-        except:
+            return float(cleaned)
+        except ValueError:
             return 0.0
-    
-    def _detect_currency(self, predictions: List[Dict]) -> str:
-        """Detect currency from text"""
-        for pred in predictions:
-            text = pred["text"].upper()
-            if '$' in text or 'USD' in text:
-                return "USD"
-            elif '€' in text or 'EUR' in text:
-                return "EUR"
-            elif '£' in text or 'GBP' in text:
-                return "GBP"
-            elif '¥' in text or 'JPY' in text:
-                return "JPY"
-            elif '₹' in text or 'INR' in text:
-                return "INR"
+
+    def detect_currency(toks: List[Dict]) -> str:
+        for t in toks:
+            txt = t.get("text", "")
+            if re.search(r"HK\$|HKD|HKS", txt, re.I): return "HKD"
+            if re.search(r"\$|USD", txt):               return "USD"
+            if re.search(r"€|EUR", txt):                return "EUR"
+            if re.search(r"£|GBP", txt):                return "GBP"
         return "USD"
-    
-    def _visualize_predictions(self, image: Image.Image, predictions: List[Dict]) -> Image.Image:
-        """Visualize predictions on image"""
-        draw = ImageDraw.Draw(image)
-        colors = {"HEADER": "red", "QUESTION": "blue", "ANSWER": "green", "OTHER": "orange"}
-        
-        for pred in predictions:
-            if pred["label"] == "O":
+
+    # ── Invoice skeleton ──────────────────────────────────────────────────────
+    invoice = {
+        "vendor_company":        "",
+        "invoice_number":        "",
+        "invoice_date":          "",
+        "due_date":              "",
+        "order_id":              "",
+        "bill_to":               "",
+        "ship_to":               "",
+        "attention":             "",
+        "items":                 [],
+        "subtotal":              0.0,
+        "shipping":              0.0,
+        "tax":                   0.0,
+        "discount":              0.0,
+        "total_amount":          0.0,
+        "balance_due":           0.0,
+        "payment_terms":         "",
+        "notes":                 "",
+        "currency":              detect_currency(tokens),
+        "extraction_confidence": round(float(np.mean([t.get("confidence", 0) for t in tokens])), 4),
+        "extraction_timestamp":  datetime.datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+    FIELD_MAP = {
+        r"invoice\s*#":      "invoice_number",
+        r"invoice\s*date":   "invoice_date",
+        r"due\s*date":       "due_date",
+        r"p\.?o\.?\s*#":    "order_id",
+        r"bill\s*to":        "bill_to",
+        r"ship\s*to":        "ship_to",
+        r"attention":        "attention",
+        r"payment\s*terms":  "payment_terms",
+        r"notes":            "notes",
+        r"subtotal":         "subtotal",
+        r"shipping|freight": "shipping",
+        r"\btax\b":          "tax",
+        r"discount":         "discount",
+        r"balance\s*due":    "balance_due",
+        r"\btotal\b":        "total_amount",
+    }
+
+    TABLE_COL_KEYWORDS = {"qty", "quantity", "description", "item",
+                          "unit price", "price", "rate", "amount"}
+
+    # ── Detect table header row — search ANY label, not just QUESTION ─────────
+    # (QTY/AMOUNT may be labeled ANSWER by the model; we detect by text content)
+    header_line = None
+    header_y    = None
+    for y, line in sorted_lines:
+        # Count tokens whose text matches a column keyword (any label)
+        col_kw_count = sum(
+            any(k in t["text"].lower() for k in TABLE_COL_KEYWORDS)
+            for t in line
+        )
+        if col_kw_count >= 2:
+            header_line = line
+            header_y    = y
+            # Force all column-keyword tokens on this line to QUESTION
+            for t in header_line:
+                if any(k in t["text"].lower() for k in TABLE_COL_KEYWORDS):
+                    t["label"] = "QUESTION"
+            break
+
+    # Build non-overlapping column boundaries sorted left-to-right
+    col_headers: List[Dict] = []
+    if header_line:
+        # Use all tokens whose text matches a column keyword (labels already fixed above)
+        qs = [t for t in header_line
+              if any(k in t["text"].lower() for k in TABLE_COL_KEYWORDS)]
+        qs.sort(key=lambda t: t["center_x"])
+        for i, t in enumerate(qs):
+            left_x  = (qs[i-1]["center_x"] + t["center_x"]) / 2 if i > 0 else 0
+            right_x = (t["center_x"] + qs[i+1]["center_x"]) / 2 if i < len(qs)-1 else img_w
+            col_headers.append({
+                "name":     t["text"].lower().strip(),
+                "center_x": t["center_x"],
+                "left_x":   left_x,
+                "right_x":  right_x,
+            })
+        # CRITICAL FIX: For description-like columns, extend left boundary to 0
+        # because description text is left-aligned under QTY header on many invoices
+        # (e.g. "Apple" at x=320 sits left of the DESCRIPTION header center at x=562)
+        for col in col_headers:
+            if any(k in col["name"] for k in ("desc", "item", "product")):
+                col["left_x"] = 0
+                logger.info(f"  Extended '{col['name']}' left boundary to 0 (left-aligned descriptions)")
+        logger.info(f"  Table columns (non-overlapping): {[(c['name'], round(c['left_x']), round(c['right_x'])) for c in col_headers]}")
+        logger.info(f"  header_y={header_y:.0f}")
+
+    # ── Compute table_bottom from TOTAL token (sorted by Y) ──────────────────
+    total_answer_tok = next(
+        (t for t in sorted(tokens, key=lambda t: t["center_y"])
+         if t["label"] == "ANSWER" and t["text"].upper() in ("TOTAL", "TOTAL:")),
+        None
+    )
+    table_bottom = (total_answer_tok["center_y"] - line_tol
+                    if total_answer_tok else img_h * 0.80)
+    logger.info(f"  Table bottom y={table_bottom:.0f}")
+
+    # ── Pass 1: key-value pairs — answer must be RIGHT of question ────────────
+    for y, line in sorted_lines:
+        q_toks = [t for t in line if t["label"] == "QUESTION"]
+        if not q_toks:
+            continue
+        q_text = " ".join(t["text"] for t in q_toks).lower().strip()
+        # Only ANSWER tokens to the RIGHT of the rightmost question token
+        q_right_edge = max(t["bbox"][2] for t in q_toks)
+        a_toks = [t for t in line
+                  if t["label"] == "ANSWER" and t["center_x"] > q_right_edge]
+        if not a_toks:
+            continue
+        a_text = " ".join(t["text"] for t in a_toks).strip()
+        for pattern, f_field in FIELD_MAP.items():
+            if re.search(pattern, q_text, re.I):
+                if f_field in ("subtotal", "shipping", "tax", "discount",
+                               "balance_due", "total_amount"):
+                    invoice[f_field] = parse_float(a_text)
+                elif f_field == "order_id":
+                    # First token to the right of PO# label only
+                    invoice[f_field] = a_toks[0]["text"].strip()
+                else:
+                    invoice[f_field] = a_text
+                break
+
+    # ── Pass 2: BILL TO — multi-line address, left half, stop at table ────────
+    bill_q = next(
+        (t for t in tokens
+         if t["label"] == "QUESTION" and re.search(r"bill\s*to", t["text"], re.I)),
+        None
+    )
+    if bill_q:
+        bqy    = bill_q["center_y"]
+        # Hard stop: just before table header row
+        max_ay = (header_y - line_tol) if header_y else bqy + img_h * 0.25
+
+        # Known field-label texts to exclude (right-side labels like INVOICE #, DUE DATE)
+        FIELD_LABEL_KWS = {"invoice", "due date", "p.o.", "po#", "ship to", "bill to",
+                           "qty", "quantity", "description", "unit price", "amount",
+                           "subtotal", "total", "tax", "discount", "shipping", "terms"}
+
+        addr_lines = []
+        for y, line in sorted_lines:
+            if y <= bqy + line_tol:
                 continue
-            
-            label_type = pred["label"].replace("B-", "").replace("I-", "")
-            color = colors.get(label_type, "gray")
-            
-            box = pred["bbox"]
-            draw.rectangle(box, outline=color, width=2)
-            
-            if pred.get("is_numeric"):
-                draw.rectangle(box, outline="yellow", width=3)
-            
-            draw.text((box[0], max(0, box[1] - 15)), label_type[:6], fill=color)
-        
-        return image
-    
-    def _empty_result(self, image_path: str, width: int, height: int) -> Dict:
-        """Return empty result structure"""
-        return {
-            "image_path": str(Path(image_path).resolve()),
-            "image_size": {"width": width, "height": height},
-            "raw_predictions": [],
-            "entity_count": 0,
-            "structured_data": {
-                "vendor_company": "",
-                "invoice_number": "",
-                "invoice_date": "",
-                "due_date": "",
-                "order_id": "",
-                "bill_to": "",
-                "ship_to": "",
-                "attention": "",
-                "items": [],
-                "subtotal": 0.0,
-                "shipping": 0.0,
-                "tax": 0.0,
-                "discount": 0.0,
-                "total_amount": 0.0,
-                "balance_due": 0.0,
-                "payment_terms": "",
-                "notes": "",
-                "currency": "USD",
-                "extraction_confidence": 0.0,
-                "extraction_timestamp": datetime.now().isoformat(),
-            }
-        }
-    
-    def save_results(self, result: Dict, output_dir: str = None):
-        """Save results to files"""
-        output_dir = Path(output_dir or "./invoice_results")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        stem = Path(result["image_path"]).stem
-        
-        vis_path = output_dir / f"{stem}_visualized.png"
-        result["visualization"].save(vis_path)
-        
-        struct_path = output_dir / f"{stem}_structured.json"
-        with open(struct_path, 'w', encoding='utf-8') as f:
-            json.dump(result["structured_data"], f, indent=2, ensure_ascii=False)
-        
-        items = result["structured_data"]["items"]
-        if items:
-            print(f"\n📦 LINE ITEMS ({len(items)}):")
-            print(f"{'Description':<40} {'Qty':>6} {'Rate':>10} {'Amount':>10}")
-            print("-" * 70)
-            for item in items[:10]:
-                desc = item["description"][:36] + "..." if len(item["description"]) > 36 else item["description"]
-                qty = item["quantity"] if item["quantity"] else "-"
-                rate = f"{item['rate']:.2f}" if item["rate"] else "-"
-                amt = f"{item['amount']:.2f}"
-                print(f"{desc:<40} {qty:>6} {rate:>10} {amt:>10}")
-            if len(items) > 10:
-                print(f"... and {len(items) - 10} more items")
-        
-        print(f"\n✅ Results saved to: {output_dir}")
-        return output_dir
+            if y >= max_ay:
+                break
+            # Collect all non-numeric, non-field-label tokens in the left half
+            # regardless of label (ANSWER, O, or mislabeled QUESTION)
+            a_toks = []
+            for t in line:
+                if t["center_x"] >= img_w * 0.50:
+                    continue
+                if t.get("is_numeric", False):
+                    continue
+                tl = t["text"].lower().strip()
+                if any(kw in tl for kw in FIELD_LABEL_KWS):
+                    continue
+                if t["label"] in ("ANSWER", "O", "QUESTION"):
+                    a_toks.append(t)
+            if a_toks:
+                line_text = " ".join(t["text"] for t in sorted(a_toks, key=lambda t: t["center_x"])).strip()
+                if line_text:
+                    addr_lines.append(line_text)
+
+        if addr_lines:
+            invoice["bill_to"] = "\n".join(addr_lines)
+        logger.info(f"  BILL TO → {invoice['bill_to']!r}")
+
+    # ── Pass 3: Vendor name — first QUESTION at top-left of page ─────────────
+    # "ABC Company Limited" is labeled QUESTION at top-left; INVOICE is HEADER
+    top_left_qs = [t for t in tokens
+                   if t["label"] == "QUESTION"
+                   and t["center_y"] < img_h * 0.20
+                   and t["center_x"] < img_w * 0.50]
+    if top_left_qs:
+        invoice["vendor_company"] = sorted(top_left_qs, key=lambda t: t["center_y"])[0]["text"]
+
+    if not invoice["vendor_company"]:
+        header_toks = [t for t in tokens if t["label"] == "HEADER"
+                       and t["text"].upper() not in ("INVOICE", "INVOICE:")]
+        if header_toks:
+            invoice["vendor_company"] = sorted(header_toks, key=lambda t: t["center_y"])[0]["text"]
+
+    # ── Pass 4: Line items using column X-range matching ─────────────────────
+    if header_y and col_headers:
+
+        def get_column(cx: float, is_numeric: bool = False) -> Optional[Dict]:
+            """Return the best column for this x position.
+            When description extends left to 0, numeric tokens prefer qty/amount,
+            text tokens prefer description."""
+            candidates = [col for col in col_headers if col["left_x"] <= cx <= col["right_x"]]
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]
+            # Numeric tokens → prefer qty/amount columns
+            if is_numeric:
+                num_cols = [c for c in candidates if any(k in c["name"] for k in ("qty", "quantity", "amount", "price", "rate"))]
+                if num_cols:
+                    return min(num_cols, key=lambda c: abs(c["center_x"] - cx))
+            # Text tokens → prefer description column
+            desc_cols = [c for c in candidates if any(k in c["name"] for k in ("desc", "item", "product"))]
+            if desc_cols:
+                return desc_cols[0]
+            return min(candidates, key=lambda c: abs(c["center_x"] - cx))
+
+        TABLE_HEADER_TEXTS = {"qty", "quantity", "description", "item",
+                              "unit price", "price", "rate", "amount"}
+
+        def is_table_token(t: Dict) -> bool:
+            if t["label"] == "ANSWER":
+                return True
+            # O-labeled numerics aligned with a column (e.g. QTY "1" labeled O)
+            if t["label"] == "O" and t.get("is_numeric"):
+                return get_column(t["center_x"], t.get("is_numeric", False)) is not None
+            # QUESTION-labeled non-header tokens inside table (e.g. "Bag" mislabeled QUESTION)
+            if t["label"] == "QUESTION":
+                if t["text"].lower().strip() in TABLE_HEADER_TEXTS:
+                    return False   # skip actual column headers
+                col = get_column(t["center_x"], t.get("is_numeric", False))
+                if col and any(k in col["name"] for k in ("desc", "item", "product")):
+                    return True   # mislabeled description word
+            return False
+
+        data_rows: Dict[float, List] = {}
+        for y, line in sorted_lines:
+            if y <= header_y + line_tol:
+                continue
+            if y > table_bottom:
+                continue
+            line_str = " ".join(t["text"] for t in line).upper()
+            if "TOTAL" in line_str:
+                continue
+            if any(re.search(pat, line_str, re.I) for pat in
+                   [r"payment\s+is\s+due", r"thank\s+you", r"powered\s+by"]):
+                continue
+            eligible = [t for t in line if is_table_token(t)]
+            if eligible:
+                data_rows[y] = eligible
+
+        logger.info(f"  Data rows: { {round(y): [t['text'] for t in toks] for y, toks in data_rows.items()} }")
+
+        for row_y, a_toks in sorted(data_rows.items()):
+            row: Dict = {"description": "", "quantity": 0.0, "unit_price": 0.0, "amount": 0.0}
+
+            for t in a_toks:
+                col = get_column(t["center_x"], t.get("is_numeric", False))
+                if col is None:
+                    continue
+                col_name = col["name"]
+                text     = t["text"].strip()
+
+                if any(k in col_name for k in ("desc", "item", "product")):
+                    row["description"] = (row["description"] + " " + text).strip()
+                elif any(k in col_name for k in ("qty", "quantity")):
+                    try:
+                        row["quantity"] = float(text.replace(",", ""))
+                    except ValueError:
+                        pass
+                elif any(k in col_name for k in ("unit price", "price", "rate")):
+                    row["unit_price"] = parse_float(text)
+                elif "amount" in col_name:
+                    row["amount"] = parse_float(text)
+
+            if row["description"] or row["amount"] != 0.0:
+                invoice["items"].append(row)
+
+        logger.info(f"  Extracted {len(invoice['items'])} items: {invoice['items']}")
+
+    # ── Pass 5: TOTAL from ANSWER-labeled TOTAL token ─────────────────────────
+    if total_answer_tok:
+        tx, ty  = total_answer_tok["center_x"], total_answer_tok["center_y"]
+        same_ln = [t for t in tokens
+                   if t["label"] == "ANSWER"
+                   and abs(t["center_y"] - ty) < line_tol
+                   and t["center_x"] > tx
+                   and t["text"].upper() not in ("TOTAL", "TOTAL:")]
+        if same_ln:
+            best = min(same_ln, key=lambda t: t["center_x"])
+            invoice["total_amount"] = parse_float(best["text"])
+            logger.info(f"  TOTAL → {invoice['total_amount']}")
+
+    # ── Pass 6: Fallback total from items sum ─────────────────────────────────
+    if invoice["total_amount"] == 0.0 and invoice["items"]:
+        invoice["total_amount"] = round(
+            sum(item.get("amount", 0.0) for item in invoice["items"]), 2)
+
+    # ── Pass 7: Date fallback ─────────────────────────────────────────────────
+    if not invoice["invoice_date"]:
+        for t in tokens:
+            if re.match(r"\d{4}[/-]\d{2}[/-]\d{2}", t["text"]):
+                invoice["invoice_date"] = t["text"]
+                break
+
+    return invoice
 
 
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
 def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description="LiLT Invoice Parser - FIXED v5")
-    parser.add_argument("image", help="Invoice image path")
-    parser.add_argument("--model", default="./lilt_invoice_model", help="Model directory")
-    parser.add_argument("--output", default="./results", help="Output directory")
-    parser.add_argument("--no-cuda", action="store_true", help="Disable CUDA")
-    
-    args = parser.parse_args()
-    
-    print("="*70)
-    print("🧾 LiLT Invoice Parser - COMPREHENSIVE FIX v5")
-    print("="*70)
-    print("✅ FIXED: Vendor extraction (filters out address labels)")
-    print("✅ FIXED: Address mixing (better boundary detection)")
-    print("✅ FIXED: Shipping amount (stricter label verification)")
-    print("✅ ADDED: Notes field extraction")
-    print("✅ IMPROVED: Order ID detection (comprehensive patterns)")
-    print("="*70)
-    
+    ap = argparse.ArgumentParser(description="LiLT Invoice Inference r23")
+    ap.add_argument("image")
+    ap.add_argument("--model", "--model_dir", dest="model_dir", default="lilt_model_11")
+    ap.add_argument("--output",        default="./results")
+    ap.add_argument("--confidence",    type=float, default=0.15)
+    ap.add_argument("--max-pair-dist", type=int,   default=50)
+    ap.add_argument("--spatial",       type=int,   default=600)
+    ap.add_argument("--no-relations",  action="store_true")
+    ap.add_argument("--no-cuda",       action="store_true")
+    ap.add_argument("--display",       action="store_true")
+    ap.add_argument("--no-refine",     action="store_true")
+    ap.add_argument("--conf-thresh",   type=float, default=0.0)
+    args = ap.parse_args()
+
+    device = "cpu" if args.no_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
+    config = InferenceConfig(
+        model_dir=args.model_dir, device=device,
+        refine_labels=not args.no_refine,
+        confidence_threshold=args.conf_thresh,
+        relation_confidence=args.confidence,
+        max_pair_dist=args.max_pair_dist,
+        spatial_dist=args.spatial,
+    )
+
+    print("=" * 70)
+    print("🧾 LiLT Invoice Inference r23")
+    print("=" * 70)
+    print(f"📁 Image:      {args.image}")
+    print(f"🤖 Model:      {args.model_dir}")
+    print(f"⚙️  Device:     {device}")
+    print(f"🔧 Refinement: {'ON' if config.refine_labels else 'OFF'}")
+    print(f"🎚️  Conf thresh: {config.confidence_threshold}")
+    print(f"🔗 Relations:  {'OFF' if args.no_relations else 'ON'}")
+    if not args.no_relations:
+        print(f"   Relation conf: {config.relation_confidence}")
+        print(f"   Spatial dist:  {config.spatial_dist} px")
+    print("=" * 70)
+
     if not Path(args.image).exists():
-        print(f"❌ Image not found: {args.image}")
+        logger.error(f"❌ Not found: {args.image}")
         sys.exit(1)
-    
-    try:
-        parser = LiLTInvoiceParser(
-            model_path=args.model,
-            use_cuda=not args.no_cuda
-        )
-        
-        result = parser.predict(args.image)
-        parser.save_results(result, args.output)
-        
-        data = result["structured_data"]
-        print("\n" + "="*70)
-        print("📋 EXTRACTION RESULTS")
-        print("="*70)
-        
-        categories = {
-            "Vendor Info": ["vendor_company"],
-            "Invoice Details": ["invoice_number", "invoice_date", "due_date", "order_id"],
-            "Addresses": ["bill_to", "ship_to", "attention"],
-            "Financials": ["subtotal", "shipping", "tax", "discount", "total_amount", "balance_due"],
-            "Other": ["payment_terms", "notes", "currency"]
-        }
-        
-        extracted = 0
-        total = 0
-        
-        for category, fields in categories.items():
-            print(f"\n{category}:")
-            for field in fields:
-                total += 1
-                value = data.get(field)
-                
-                if field in ["bill_to", "ship_to"] and value and "\n" in value:
-                    lines = value.split("\n")
-                    print(f"  ✅ {field:15}: {len(lines)} lines")
-                    extracted += 1
-                elif field in ["subtotal", "shipping", "tax", "discount", "total_amount", "balance_due"]:
-                    if isinstance(value, (int, float)) and value > 0:
-                        print(f"  ✅ {field:15}: {data['currency']} {value:.2f}")
-                        extracted += 1
-                    else:
-                        print(f"  ❌ {field:15}: Not found")
-                elif field == "items" and value:
-                    print(f"  ✅ {field:15}: {len(value)} items (see above)")
-                    extracted += 1
-                elif value and value not in ["", 0.0, 0, []]:
-                    display = str(value)[:40] + "..." if len(str(value)) > 40 else str(value)
-                    print(f"  ✅ {field:15}: {display}")
-                    extracted += 1
-                else:
-                    print(f"  ❌ {field:15}: Not found")
-        
-        print(f"\n📊 Summary: {extracted}/{total} fields extracted | Confidence: {data.get('extraction_confidence', 0):.1%}")
-        print("="*70)
-        
-    except Exception as e:
-        print(f"\n❌ Critical error: {e}")
-        import traceback
-        traceback.print_exc()
+
+    extractor = LabelExtractor(config)
+    result    = extractor.extract(args.image)
+
+    if "error" in result:
+        logger.error(f"Extraction failed: {result['error']}")
         sys.exit(1)
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(args.image).stem
+
+    out_json = out_dir / f"{stem}_labels.json"
+    with open(out_json, "w") as f:
+        json.dump({
+            "image":  result["image_path"],
+            "size":   result["image_size"],
+            "stats":  result["stats"],
+            "tokens": [{"text": t["text"], "label": t["label"], "confidence": t["confidence"]}
+                       for t in result["tokens"]],
+        }, f, indent=2)
+    logger.info(f"💾 Saved labels: {out_json}")
+
+    invoice_data = build_invoice_json(result, args.image)
+    invoice_path = out_dir / f"{stem}_invoice.json"
+    with open(invoice_path, "w") as f:
+        json.dump(invoice_data, f, indent=2)
+    logger.info(f"💾 Saved invoice: {invoice_path}")
+
+    if not args.no_relations:
+        img_w, img_h = result["image_size"]["width"], result["image_size"]["height"]
+        relations    = extract_relations(result["tokens"], config, img_w, img_h)
+        rel_path     = out_dir / f"{stem}_relations.json"
+        with open(rel_path, "w") as f:
+            json.dump(relations, f, indent=2)
+        logger.info(f"💾 Saved relations: {rel_path}")
+        if relations:
+            print("\n" + "=" * 70)
+            print("🔗 Extracted Relations (QUESTION → ANSWER)")
+            print("=" * 70)
+            for r in relations:
+                print(f"   '{r['question']}'  →  '{r['answer']}'  (conf={r['confidence']})")
+            print("=" * 70)
+        else:
+            print("\n🔗 No relations found.\n")
+
+    if result.get("visualization"):
+        vis_path = out_dir / f"{stem}_visualization.png"
+        result["visualization"].save(vis_path)
+        logger.info(f"💾 Saved visualization: {vis_path}")
+        if args.display:
+            try:
+                result["visualization"].show()
+            except Exception as e:
+                logger.warning(f"Display failed: {e}")
+
+    s = result["stats"]
+    print("\n" + "=" * 70)
+    print("📊 Label Counts")
+    print("=" * 70)
+    print(f"   HEADER   : {s['HEADER']}")
+    print(f"   QUESTION : {s['QUESTION']}")
+    print(f"   ANSWER   : {s['ANSWER']}")
+    print(f"   O        : {s['O']}")
+    print("=" * 70)
+    for label in ["HEADER", "QUESTION", "ANSWER"]:
+        examples = [t for t in result["tokens"] if t["label"] == label][:5]
+        if examples:
+            print(f"\n{label} examples:")
+            for ex in examples:
+                print(f"   '{ex['text']}' (conf={ex['confidence']})")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
