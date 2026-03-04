@@ -1,0 +1,95 @@
+datasets>=2.10.1
+transformers>=4.38.2
+seqeval==1.2.2
+
+# Core PyTorch ecosystem (adjust CUDA version as needed)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Transformers & LayoutLMv3
+transformers>=4.37.0
+accelerate>=0.25.0
+
+# Data handling
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image processing
+Pillow>=9.5.0
+opencv-python>=4.8.0
+
+# OCR (for LiLT inference/training preprocessing)
+easyocr>=1.7.0
+pytesseract>=0.3.10
+pdf2image>=1.16.0  # For PDF support
+
+# Utilities
+tqdm>=4.65.0
+scikit-learn>=1.3.0  # For metrics/splitting if needed
+
+# Optional: Weights & Biases for experiment tracking
+# wandb>=0.15.0
+
+# Optional: TensorBoard
+tensorboard>=2.14.0
+
+# Core PyTorch ecosystem (adjust CUDA version as needed)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Transformers & LayoutLMv3/LiLT
+transformers>=4.37.0
+accelerate>=0.25.0
+
+# Data handling
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image processing
+Pillow>=9.5.0
+opencv-python>=4.8.0
+
+# OCR (for inference preprocessing)
+easyocr>=1.7.0
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+
+# Metrics & utilities
+scikit-learn>=1.3.0
+tqdm>=4.65.0
+
+# Optional: Weights & Biases for experiment tracking
+# wandb>=0.15.0
+
+# Optional: TensorBoard
+tensorboard>=2.14.0
+
+# Core PyTorch ecosystem (adjust CUDA version as needed)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Transformers & LayoutLMv3
+transformers>=4.37.0
+accelerate>=0.25.0
+
+# Data handling
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image processing
+Pillow>=9.5.0
+opencv-python>=4.8.0
+
+# OCR (for inference preprocessing)
+easyocr>=1.7.0
+pytesseract>=0.3.10
+pdf2image>=1.16.0  # For PDF support
+
+# Utilities
+tqdm>=4.65.0
+
+# Optional: For development/debugging
+# ipython>=8.0.0
+# matplotlib>=3.7.0
+
+
